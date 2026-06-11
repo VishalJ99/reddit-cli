@@ -89,11 +89,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "rdt --rss sync is planned but not implemented yet; run JSON sync or use RSS browse/search for degraded reads"
                 );
             }
-            if command.refresh {
-                anyhow::bail!(
-                    "rdt sync --refresh is planned but not implemented yet; this sync pass only captures listing pages"
-                );
-            }
 
             let client = RedditClient::new(&config, &cli)?;
             loop {

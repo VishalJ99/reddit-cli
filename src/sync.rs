@@ -33,8 +33,48 @@ pub async fn run_once(
     for subreddit in subreddits {
         reports.push(sync_stream(paths, client, &subreddit, StreamKind::Posts, command).await?);
         reports.push(sync_stream(paths, client, &subreddit, StreamKind::Comments, command).await?);
+        if command.refresh {
+            reports.push(sync_refresh(paths, client, &subreddit, command).await?);
+        }
     }
     Ok(reports)
+}
+
+async fn sync_refresh(
+    paths: &Paths,
+    client: &RedditClient,
+    subreddit: &str,
+    command: &SyncCommand,
+) -> Result<SyncStreamReport> {
+    let started = store::utc_now();
+    let mut progress = SyncProgress::default();
+    let result = sync_refresh_inner(paths, client, subreddit, command, &mut progress).await;
+
+    match result {
+        Ok(report) => {
+            store::append_sync_log(paths, &report, started, store::utc_now(), None)?;
+            Ok(report)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let report = SyncStreamReport {
+                subreddit: store::normalize_subreddit(subreddit),
+                kind: StreamKind::Refresh,
+                new_items: progress.new_items,
+                updated_items: progress.updated_items,
+                http_requests: progress.http_requests,
+                status: "error".to_owned(),
+                remaining_items: None,
+                notice: Some(message.clone()),
+            };
+            if let Err(log_error) =
+                store::append_sync_log(paths, &report, started, store::utc_now(), Some(&message))
+            {
+                return Err(error.context(format!("also failed to append sync_log: {log_error}")));
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn sync_stream(
@@ -87,6 +127,7 @@ async fn sync_stream_inner(
         StreamKind::Posts => "new",
         StreamKind::Comments => "comments",
         StreamKind::Backfill => unreachable!("backfill is not a watch stream"),
+        StreamKind::Refresh => unreachable!("refresh is not a watch stream"),
     };
     let mut remaining = command.budget.max(1) as usize;
     let page_cap = command
@@ -148,6 +189,45 @@ async fn sync_stream_inner(
     Ok(report)
 }
 
+async fn sync_refresh_inner(
+    paths: &Paths,
+    client: &RedditClient,
+    subreddit: &str,
+    command: &SyncCommand,
+    progress: &mut SyncProgress,
+) -> Result<SyncStreamReport> {
+    let max_items = command.budget.max(1) as usize;
+    let page_cap = command
+        .pages
+        .map(|pages| pages.max(1) as usize)
+        .unwrap_or_else(|| max_items.div_ceil(100).max(1));
+    let request_limit = max_items.min(page_cap.saturating_mul(100));
+    let total_candidates = store::post_count(paths, subreddit)?;
+    let candidates = store::recent_post_fullnames(paths, subreddit, request_limit)?;
+    let remaining_items = total_candidates.saturating_sub(candidates.len());
+
+    for chunk in candidates.chunks(100) {
+        progress.http_requests += 1;
+        let items = client.info_by_ids(chunk).await?;
+        let stats = store::upsert_items(paths, subreddit, StreamKind::Posts, &items)?;
+        progress.new_items += stats.new_items;
+        progress.updated_items += stats.updated_items;
+    }
+
+    Ok(SyncStreamReport {
+        subreddit: store::normalize_subreddit(subreddit),
+        kind: StreamKind::Refresh,
+        new_items: progress.new_items,
+        updated_items: progress.updated_items,
+        http_requests: progress.http_requests,
+        status: if remaining_items > 0 { "gap" } else { "ok" }.to_owned(),
+        remaining_items: (remaining_items > 0).then_some(remaining_items),
+        notice: (remaining_items > 0).then(|| {
+            format!("refresh capped at {request_limit} recent post(s); raise --budget/--pages to refresh more")
+        }),
+    })
+}
+
 fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
     page.items
         .iter()
@@ -155,6 +235,7 @@ fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
             StreamKind::Posts => item.kind == crate::model::ItemKind::Post,
             StreamKind::Comments => item.kind == crate::model::ItemKind::Comment,
             StreamKind::Backfill => false,
+            StreamKind::Refresh => false,
         })
         .count()
 }

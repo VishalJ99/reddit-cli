@@ -14,7 +14,7 @@ This is the bootstrap implementation for the public project:
 - Transport selection supports configured cookie JSON, anonymous JSON, and `--rss` degraded mode. JSON edge-block detection falls back to RSS where a corresponding feed exists.
 - `rdt copy`, `rdt open`, `rdt save`, `rdt saved`, `rdt watch add/rm/ls`, and `rdt db path/query/search` are scaffolded on local XDG state.
 - The SQLite schema from the design is present with watches, posts, comments, sync log, saved links, and FTS tables.
-- `rdt sync` populates posts and comments for active watches or explicit `--sub` targets. `rdt pull` deep-captures a selected post into SQLite using the same read-only thread resolver.
+- `rdt sync` populates posts and comments for active watches or explicit `--sub` targets, and `rdt sync --refresh` hydrates recent stored posts through `/api/info.json`. `rdt pull` deep-captures a selected post into SQLite using the same read-only thread resolver.
 
 ## Build
 
@@ -89,13 +89,14 @@ rdt db path
 rdt watch add rust programming
 rdt watch ls
 rdt sync --sub rust --budget 300
+rdt sync --sub rust --refresh --budget 100
 rdt sync --sub rust --budget 500 --pages 5
 rdt pull 1 --max-requests 10
 rdt save 1 --note "worth reading later"
 rdt saved
 ```
 
-`rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`).
+`rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`). `--refresh` also hydrates recent stored posts for each synced subreddit; it uses the same caps and logs `kind = refresh`.
 
 `rdt pull` is the heavier path for an interesting post. It expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`.
 

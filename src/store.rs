@@ -17,6 +17,7 @@ pub enum StreamKind {
     Posts,
     Comments,
     Backfill,
+    Refresh,
 }
 
 impl StreamKind {
@@ -25,6 +26,7 @@ impl StreamKind {
             Self::Posts => "posts",
             Self::Comments => "comments",
             Self::Backfill => "backfill",
+            Self::Refresh => "refresh",
         }
     }
 }
@@ -168,6 +170,7 @@ pub fn known_count(paths: &Paths, kind: StreamKind, items: &[RedditItem]) -> Res
         StreamKind::Posts => "posts",
         StreamKind::Comments => "comments",
         StreamKind::Backfill => anyhow::bail!("backfill is not a concrete item table"),
+        StreamKind::Refresh => anyhow::bail!("refresh is not a concrete item table"),
     };
     let sql = format!("SELECT 1 FROM {table} WHERE id = ?1 LIMIT 1");
     let mut stmt = conn.prepare(&sql)?;
@@ -207,6 +210,7 @@ pub fn upsert_items(
                 }
             }
             StreamKind::Backfill => anyhow::bail!("backfill upsert requires a thread view"),
+            StreamKind::Refresh => anyhow::bail!("refresh upsert requires concrete post items"),
         }
     }
 
@@ -293,8 +297,37 @@ pub fn update_watch_watermark(
             params![subreddit, newest_fullname, now],
         )?,
         StreamKind::Backfill => anyhow::bail!("backfill does not use watch watermarks"),
+        StreamKind::Refresh => anyhow::bail!("refresh does not use watch watermarks"),
     };
     Ok(())
+}
+
+pub fn recent_post_fullnames(paths: &Paths, subreddit: &str, limit: usize) -> Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let conn = open(paths)?;
+    let mut stmt = conn.prepare(
+        "SELECT 't3_' || id
+         FROM posts
+         WHERE subreddit = ?1
+         ORDER BY COALESCE(created_utc, first_seen_utc, last_updated_utc, 0) DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![clean_subreddit(subreddit), limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub fn post_count(paths: &Paths, subreddit: &str) -> Result<usize> {
+    let conn = open(paths)?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM posts WHERE subreddit = ?1",
+        params![clean_subreddit(subreddit)],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count.max(0) as usize)
 }
 
 pub fn append_sync_log(
@@ -868,6 +901,26 @@ mod tests {
         .unwrap();
         assert_eq!(rows[0].get("kind"), Some(&json!("backfill")));
         assert_eq!(rows[0].get("status"), Some(&json!("gap")));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn recent_post_fullnames_selects_newest_posts_for_refresh() {
+        let paths = temp_paths();
+        let mut older = test_post("old");
+        older.created_utc = Some(10.0);
+        let mut newer = test_post("new");
+        newer.created_utc = Some(30.0);
+        let mut middle = test_post("mid");
+        middle.created_utc = Some(20.0);
+
+        upsert_items(&paths, "r/RUST", StreamKind::Posts, &[older, newer, middle]).unwrap();
+        assert_eq!(
+            recent_post_fullnames(&paths, "RUST", 2).unwrap(),
+            vec!["t3_new".to_owned(), "t3_mid".to_owned()]
+        );
+        assert_eq!(post_count(&paths, "rust").unwrap(), 3);
+        assert!(recent_post_fullnames(&paths, "rust", 0).unwrap().is_empty());
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 

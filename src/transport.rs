@@ -122,6 +122,22 @@ impl RedditClient {
         Ok(parse::parse_listing_page(&value))
     }
 
+    pub async fn info_by_ids(&self, ids: &[String]) -> Result<Vec<RedditItem>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > 100 {
+            anyhow::bail!("api/info batch exceeds 100 ids");
+        }
+        for id in ids {
+            validate_fullname(id)?;
+        }
+        let joined = ids.join(",");
+        let params = [("id", joined.as_str())];
+        let value = self.get_json("/api/info.json", &params).await?;
+        Ok(parse::parse_listing(&value))
+    }
+
     pub async fn subreddits(&self, query: &str) -> Result<Vec<RedditItem>> {
         let params = [("q", query), ("limit", "25")];
         let value = self
@@ -557,6 +573,18 @@ fn listing_segment(input: &str) -> Result<&str> {
     }
 }
 
+fn validate_fullname(input: &str) -> Result<()> {
+    let Some((kind, id)) = input.split_once('_') else {
+        anyhow::bail!("invalid Reddit fullname: {input}");
+    };
+    let valid_kind = matches!(kind, "t1" | "t2" | "t3" | "t5");
+    if valid_kind && is_probable_base36_id(id) {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid Reddit fullname: {input}")
+    }
+}
+
 fn thread_subtree_path(base_json_path: &str, comment_id: &str) -> String {
     let base = base_json_path
         .trim_end_matches(".json")
@@ -688,5 +716,13 @@ mod tests {
     fn wraps_cookie_values() {
         assert_eq!(cookie_header("abc"), "reddit_session=abc");
         assert_eq!(cookie_header("reddit_session=abc"), "reddit_session=abc");
+    }
+
+    #[test]
+    fn validates_api_info_fullnames() {
+        assert!(validate_fullname("t3_abc123").is_ok());
+        assert!(validate_fullname("abc123").is_err());
+        assert!(validate_fullname("t9_abc123").is_err());
+        assert!(validate_fullname("t3_not/valid").is_err());
     }
 }

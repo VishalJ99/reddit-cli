@@ -139,7 +139,10 @@ pub struct SyncCommand {
     pub loop_secs: Option<u64>,
     #[arg(long, default_value_t = 300, help = "Target item budget per stream")]
     pub budget: u32,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Hydrate recent stored posts with /api/info after stream sync"
+    )]
     pub refresh: bool,
 }
 
