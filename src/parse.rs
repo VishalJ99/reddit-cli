@@ -1,10 +1,16 @@
-use crate::model::{ItemKind, ItemSource, RedditItem, ThreadView, canonical_permalink};
+use crate::model::{
+    ItemKind, ItemSource, ListingPage, RedditItem, ThreadView, canonical_permalink,
+};
 use anyhow::Result;
 use quick_xml::{Reader, events::Event};
 use serde_json::Value;
 
 pub fn parse_listing(value: &Value) -> Vec<RedditItem> {
-    value
+    parse_listing_page(value).items
+}
+
+pub fn parse_listing_page(value: &Value) -> ListingPage {
+    let items = value
         .pointer("/data/children")
         .and_then(Value::as_array)
         .map(|children| {
@@ -13,7 +19,13 @@ pub fn parse_listing(value: &Value) -> Vec<RedditItem> {
                 .filter_map(|thing| parse_thing(thing, 0, ItemSource::Json))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    ListingPage {
+        items,
+        after: string_field(&value["data"], "after"),
+        before: string_field(&value["data"], "before"),
+    }
 }
 
 pub fn parse_thread(value: &Value, notice: Option<String>) -> ThreadView {
@@ -167,19 +179,38 @@ fn parse_thing(thing: &Value, depth: usize, source: ItemSource) -> Option<Reddit
     });
 
     let permalink = string_field(data, "permalink").map(|value| canonical_permalink(&value));
+    let link_id = string_field(data, "link_id");
+    let post_id = link_id
+        .as_deref()
+        .and_then(|value| value.strip_prefix("t3_"))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if kind == ItemKind::Post {
+                Some(id.clone())
+            } else {
+                None
+            }
+        });
 
     Some(RedditItem {
         index: None,
         kind,
         id,
         fullname,
+        parent_id: string_field(data, "parent_id"),
+        post_id,
         title: string_field(data, "title").or_else(|| string_field(data, "display_name_prefixed")),
         author: string_field(data, "author").or_else(|| string_field(data, "name")),
         subreddit: string_field(data, "subreddit"),
         body: string_field(data, "body").or_else(|| string_field(data, "selftext")),
+        flair: string_field(data, "link_flair_text"),
+        is_self: bool_field(data, "is_self"),
+        over_18: bool_field(data, "over_18"),
         score: int_field(data, "score"),
+        upvote_ratio: data.get("upvote_ratio").and_then(Value::as_f64),
         num_comments: int_field(data, "num_comments"),
         created_utc: data.get("created_utc").and_then(Value::as_f64),
+        edited_utc: edited_field(data),
         permalink,
         url: string_field(data, "url"),
         depth,
@@ -196,6 +227,17 @@ fn string_field(data: &Value, key: &str) -> Option<String> {
 
 fn int_field(data: &Value, key: &str) -> Option<i64> {
     data.get(key).and_then(Value::as_i64)
+}
+
+fn bool_field(data: &Value, key: &str) -> Option<bool> {
+    data.get(key).and_then(Value::as_bool)
+}
+
+fn edited_field(data: &Value) -> Option<f64> {
+    match data.get("edited") {
+        Some(Value::Number(value)) => value.as_f64(),
+        _ => None,
+    }
 }
 
 fn local_name(name: &[u8]) -> String {
@@ -229,13 +271,20 @@ impl AtomEntry {
             kind: ItemKind::Post,
             id: id.clone(),
             fullname: id,
+            parent_id: None,
+            post_id: None,
             title: self.title.clone(),
             author: self.author.clone(),
             subreddit,
             body: self.body.clone(),
+            flair: None,
+            is_self: None,
+            over_18: None,
             score: None,
+            upvote_ratio: None,
             num_comments: None,
             created_utc: None,
+            edited_utc: None,
             permalink: link,
             url: self.link.clone(),
             depth: 0,
@@ -282,6 +331,7 @@ mod tests {
             "https://www.reddit.com/r/rust/comments/abc/hello/"
         );
         assert_eq!(items[0].kind, ItemKind::Post);
+        assert_eq!(items[0].post_id.as_deref(), Some("abc"));
     }
 
     #[test]

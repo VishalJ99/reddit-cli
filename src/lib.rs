@@ -6,6 +6,7 @@ pub mod model;
 pub mod parse;
 pub mod render;
 pub mod store;
+pub mod sync;
 pub mod transport;
 
 pub use cli::Cli;
@@ -13,6 +14,7 @@ pub use cli::Cli;
 use anyhow::Context;
 use cli::{AuthCommand, Commands, DbCommand, WatchCommand};
 use config::{Config, Paths};
+use std::time::Duration;
 use transport::RedditClient;
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -81,10 +83,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Commands::Sync(command) => {
-            let _ = command;
-            anyhow::bail!(
-                "sync is planned for M3 in DESIGN.md; watch storage is scaffolded, but polling is not implemented yet"
-            );
+            if cli.rss {
+                anyhow::bail!(
+                    "rdt --rss sync is planned but not implemented yet; run JSON sync or use RSS browse/search for degraded reads"
+                );
+            }
+            if command.refresh {
+                anyhow::bail!(
+                    "rdt sync --refresh is planned but not implemented yet; this sync pass only captures listing pages"
+                );
+            }
+
+            let client = RedditClient::new(&config, &cli)?;
+            loop {
+                let reports = sync::run_once(&paths, &client, command).await?;
+                render::print_sync_reports(&reports, cli.json)?;
+
+                let Some(loop_secs) = command.loop_secs else {
+                    break;
+                };
+                tokio::time::sleep(Duration::from_secs(loop_secs)).await;
+            }
         }
         Commands::Pull(command) => {
             let _ = command;

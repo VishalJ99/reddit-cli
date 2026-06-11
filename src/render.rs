@@ -1,4 +1,7 @@
-use crate::model::{DbRow, ItemKind, RedditItem, ThreadView};
+use crate::{
+    model::{DbRow, ItemKind, RedditItem, ThreadView},
+    store::SyncStreamReport,
+};
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use serde::Serialize;
@@ -89,6 +92,39 @@ pub fn print_digest(rows: &[DbRow], json: bool) -> Result<()> {
         if !permalink.is_empty() {
             println!("  {permalink}");
         }
+    }
+    Ok(())
+}
+
+pub fn print_sync_reports(reports: &[SyncStreamReport], json: bool) -> Result<()> {
+    if json {
+        let rows = reports
+            .iter()
+            .map(|report| {
+                serde_json::json!({
+                    "subreddit": report.subreddit,
+                    "kind": report.kind.as_str(),
+                    "new_items": report.new_items,
+                    "updated_items": report.updated_items,
+                    "http_requests": report.http_requests,
+                    "status": report.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    for report in reports {
+        println!(
+            "r/{} {}: {} new, {} updated, {} request(s), {}",
+            report.subreddit,
+            report.kind.as_str(),
+            report.new_items,
+            report.updated_items,
+            report.http_requests,
+            report.status
+        );
     }
     Ok(())
 }

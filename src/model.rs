@@ -17,17 +17,31 @@ pub struct RedditItem {
     pub kind: ItemKind,
     pub id: String,
     pub fullname: String,
+    pub parent_id: Option<String>,
+    pub post_id: Option<String>,
     pub title: Option<String>,
     pub author: Option<String>,
     pub subreddit: Option<String>,
     pub body: Option<String>,
+    pub flair: Option<String>,
+    pub is_self: Option<bool>,
+    pub over_18: Option<bool>,
     pub score: Option<i64>,
+    pub upvote_ratio: Option<f64>,
     pub num_comments: Option<i64>,
     pub created_utc: Option<f64>,
+    pub edited_utc: Option<f64>,
     pub permalink: Option<String>,
     pub url: Option<String>,
     pub depth: usize,
     pub source: ItemSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListingPage {
+    pub items: Vec<RedditItem>,
+    pub after: Option<String>,
+    pub before: Option<String>,
 }
 
 impl RedditItem {

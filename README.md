@@ -14,7 +14,7 @@ This is the bootstrap implementation for the public project:
 - Transport selection supports configured cookie JSON, anonymous JSON, and `--rss` degraded mode. JSON edge-block detection falls back to RSS where a corresponding feed exists.
 - `rdt copy`, `rdt open`, `rdt save`, `rdt saved`, `rdt watch add/rm/ls`, and `rdt db path/query/search` are scaffolded on local XDG state.
 - The SQLite schema from the design is present with watches, posts, comments, sync log, saved links, and FTS tables.
-- `rdt sync` and `rdt pull` are explicit M3 placeholders. Full `morechildren` expansion for `rdt thread --all` is not implemented in this bootstrap.
+- `rdt sync` populates posts and comments for active watches or explicit `--sub` targets. Full `morechildren` expansion for `rdt thread --all` and `rdt pull` are still planned.
 
 ## Build
 
@@ -88,9 +88,13 @@ Use:
 rdt db path
 rdt watch add rust programming
 rdt watch ls
+rdt sync --sub rust --budget 300
+rdt sync --sub rust --budget 500 --pages 5
 rdt save 1 --note "worth reading later"
 rdt saved
 ```
+
+`rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`).
 
 ## Read-Only Boundary
 

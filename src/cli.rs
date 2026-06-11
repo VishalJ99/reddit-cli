@@ -127,9 +127,17 @@ pub enum WatchCommand {
 
 #[derive(Debug, Args)]
 pub struct SyncCommand {
-    #[arg(long)]
+    #[arg(
+        long = "sub",
+        value_delimiter = ',',
+        help = "Sync explicit subreddit(s) instead of only active watches"
+    )]
+    pub subreddits: Vec<String>,
+    #[arg(long, help = "Override the page cap per stream")]
+    pub pages: Option<u32>,
+    #[arg(long = "loop", help = "Repeat sync every SECS seconds")]
     pub loop_secs: Option<u64>,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 300, help = "Target item budget per stream")]
     pub budget: u32,
     #[arg(long)]
     pub refresh: bool,

@@ -2,7 +2,7 @@ use crate::{
     cli::{BrowseCommand, SearchCommand, SubCommand, ThreadCommand, UserCommand},
     config::Config,
     error::RdtError,
-    model::{RedditItem, ThreadView},
+    model::{ListingPage, RedditItem, ThreadView},
     parse,
 };
 use anyhow::{Context, Result};
@@ -96,6 +96,29 @@ impl RedditClient {
 
         self.fetch_listing_with_fallback(&json_path, &rss_path, &params)
             .await
+    }
+
+    pub async fn sync_listing_page(
+        &self,
+        subreddit: &str,
+        listing: &str,
+        limit: u32,
+        after: Option<&str>,
+    ) -> Result<ListingPage> {
+        let subreddit = subreddit_segment(subreddit)?;
+        let listing = listing_segment(listing)?;
+        let path = format!("/r/{subreddit}/{listing}.json");
+        let limit = limit.clamp(1, 100).to_string();
+        let mut owned = vec![("limit".to_owned(), limit)];
+        if let Some(after) = after {
+            owned.push(("after".to_owned(), after.to_owned()));
+        }
+        let params = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let value = self.get_json(&path, &params).await?;
+        Ok(parse::parse_listing_page(&value))
     }
 
     pub async fn subreddits(&self, query: &str) -> Result<Vec<RedditItem>> {
@@ -431,6 +454,13 @@ fn user_segment(input: &str) -> Result<String> {
         Ok(username.to_owned())
     } else {
         anyhow::bail!("invalid Reddit username: {input}")
+    }
+}
+
+fn listing_segment(input: &str) -> Result<&str> {
+    match input {
+        "new" | "comments" => Ok(input),
+        _ => anyhow::bail!("invalid listing for sync: {input}"),
     }
 }
 
