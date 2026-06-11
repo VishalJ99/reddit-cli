@@ -24,7 +24,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match &cli.command {
         Commands::Search(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             if command.local {
                 let rows = store::search(&paths, &command.query)?;
                 render::print_db_rows(&rows, cli.json)?;
@@ -36,36 +36,36 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             render::print_items(&items, cli.json, cli.no_color)?;
         }
         Commands::Browse(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let mut items = client.browse(command).await?;
             actions::write_last(&paths, &mut items)?;
             render::print_items(&items, cli.json, cli.no_color)?;
         }
         Commands::Subs(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let mut items = client.subreddits(&command.query).await?;
             actions::write_last(&paths, &mut items)?;
             render::print_items(&items, cli.json, cli.no_color)?;
         }
         Commands::Sub(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let value = client.subreddit_about(&command.name).await?;
             render::print_json_or_debug(&value, cli.json)?;
         }
         Commands::User(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let mut items = client.user(command).await?;
             actions::write_last(&paths, &mut items)?;
             render::print_items(&items, cli.json, cli.no_color)?;
         }
         Commands::Thread(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let target = actions::resolve_target(&paths, &command.target)?;
             let thread = client.thread(command, &target).await?;
             render::print_thread(&thread, cli.json, cli.no_color)?;
         }
         Commands::Comment(command) => {
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let thread = client.comment(&command.url, command.context).await?;
             render::print_thread(&thread, cli.json, cli.no_color)?;
         }
@@ -90,7 +90,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             loop {
                 let reports = sync::run_once(&paths, &client, command).await?;
                 render::print_sync_reports(&reports, cli.json)?;
@@ -107,7 +107,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "rdt --rss pull is planned but not implemented yet; full-depth pull needs JSON parent metadata"
                 );
             }
-            let client = RedditClient::new(&config, &cli)?;
+            let client = RedditClient::new(&config, &paths, &cli)?;
             let target = actions::resolve_post_target(&paths, &command.target)?;
             let thread_command = ThreadCommand {
                 target: command.target.clone(),
@@ -163,7 +163,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Auth(command) => match command {
             AuthCommand::Check => {
-                let client = RedditClient::new(&config, &cli)?;
+                let client = RedditClient::new(&config, &paths, &cli)?;
                 let me = client.auth_check().await?;
                 println!("{me}");
             }

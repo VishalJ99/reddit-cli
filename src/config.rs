@@ -35,6 +35,7 @@ pub struct Config {
     pub cookie: Option<String>,
     pub cookie_file: Option<PathBuf>,
     pub request_delay_ms: Option<u64>,
+    pub cache_ttl_secs: Option<u64>,
     pub page_cap: Option<u32>,
 }
 
@@ -92,6 +93,9 @@ impl Config {
         }
         if self.request_delay_ms.is_none() {
             self.request_delay_ms = other.request_delay_ms;
+        }
+        if self.cache_ttl_secs.is_none() {
+            self.cache_ttl_secs = other.cache_ttl_secs;
         }
         if self.page_cap.is_none() {
             self.page_cap = other.page_cap;

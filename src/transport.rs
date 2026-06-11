@@ -1,6 +1,6 @@
 use crate::{
     cli::{BrowseCommand, SearchCommand, SubCommand, ThreadCommand, UserCommand},
-    config::Config,
+    config::{Config, Paths},
     error::RdtError,
     model::{ListingPage, MoreStub, RedditItem, ThreadView},
     parse,
@@ -8,7 +8,13 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use url::Url;
 use wreq::header::{ACCEPT, COOKIE};
 use wreq_util::Emulation;
@@ -19,6 +25,13 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " by u/local-readonly"
 );
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMode {
+    Use,
+    Bypass,
+}
 
 pub struct RedditClient {
     http: wreq::Client,
@@ -27,10 +40,12 @@ pub struct RedditClient {
     force_rss: bool,
     fresh: bool,
     request_delay: Duration,
+    cache_dir: PathBuf,
+    cache_ttl: Duration,
 }
 
 impl RedditClient {
-    pub fn new(config: &Config, cli: &crate::cli::Cli) -> Result<Self> {
+    pub fn new(config: &Config, paths: &Paths, cli: &crate::cli::Cli) -> Result<Self> {
         let http = wreq::Client::builder()
             .emulation(Emulation::Chrome133)
             .user_agent(USER_AGENT)
@@ -44,6 +59,11 @@ impl RedditClient {
             force_rss: cli.rss,
             fresh: cli.fresh,
             request_delay: Duration::from_millis(config.request_delay_ms.unwrap_or(1000)),
+            cache_dir: paths.cache_dir.join("http"),
+            cache_ttl: config
+                .cache_ttl_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_CACHE_TTL),
         })
     }
 
@@ -118,7 +138,7 @@ impl RedditClient {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        let value = self.get_json(&path, &params).await?;
+        let value = self.get_json_uncached(&path, &params).await?;
         Ok(parse::parse_listing_page(&value))
     }
 
@@ -134,7 +154,7 @@ impl RedditClient {
         }
         let joined = ids.join(",");
         let params = [("id", joined.as_str())];
-        let value = self.get_json("/api/info.json", &params).await?;
+        let value = self.get_json_uncached("/api/info.json", &params).await?;
         Ok(parse::parse_listing(&value))
     }
 
@@ -337,7 +357,7 @@ impl RedditClient {
         params: &[(&str, &str)],
     ) -> Result<Vec<RedditItem>> {
         eprintln!("warning: RSS degraded mode; scores and some metadata are unavailable");
-        let text = self.get_text(path, params, true).await?;
+        let text = self.get_text(path, params, true, CacheMode::Use).await?;
         let mut items = parse::parse_atom_entries(&text)?;
         for (index, item) in items.iter_mut().enumerate() {
             item.index = Some(index + 1);
@@ -349,7 +369,7 @@ impl RedditClient {
         eprintln!(
             "warning: RSS degraded mode; comments are flat and scores/tree metadata are unavailable"
         );
-        let text = self.get_text(path, &[], true).await?;
+        let text = self.get_text(path, &[], true, CacheMode::Use).await?;
         let entries = parse::parse_atom_entries(&text)?;
         let post = entries.first().cloned();
         let comments = entries
@@ -379,19 +399,47 @@ impl RedditClient {
     }
 
     async fn get_json(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+        self.get_json_with_cache(path, params, CacheMode::Use).await
+    }
+
+    async fn get_json_uncached(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+        self.get_json_with_cache(path, params, CacheMode::Bypass)
+            .await
+    }
+
+    async fn get_json_with_cache(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        cache_mode: CacheMode,
+    ) -> Result<Value> {
         let mut owned = params
             .iter()
             .map(|(key, value)| (*key, *value))
             .collect::<Vec<_>>();
         owned.push(("raw_json", "1"));
-        let text = self.get_text(path, &owned, false).await?;
+        let text = self.get_text(path, &owned, false, cache_mode).await?;
         serde_json::from_str(&text).context("parsing reddit JSON")
     }
 
-    async fn get_text(&self, path: &str, params: &[(&str, &str)], rss: bool) -> Result<String> {
+    async fn get_text(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        rss: bool,
+        cache_mode: CacheMode,
+    ) -> Result<String> {
         let url = build_url(path, params)?;
+        let cache_entry = should_write_cache(cache_mode).then(|| self.cache_entry(&url, rss));
+        if should_read_cache(self.fresh, cache_mode)
+            && let Some(entry) = &cache_entry
+            && let Some(text) = read_cache_entry(entry, self.cache_ttl)?
+        {
+            return Ok(text);
+        }
+
         self.pace().await;
-        match self.get_text_once(&url, rss).await {
+        let text = match self.get_text_once(&url, rss).await {
             Ok(text) => Ok(text),
             Err(error) if is_retryable_rate_limit(&error) => {
                 self.sleep_retry_after(&error).await;
@@ -400,7 +448,14 @@ impl RedditClient {
                     .map_err(|_| RdtError::RateLimited { url }.into())
             }
             Err(error) => Err(error),
+        }?;
+
+        if should_write_cache(cache_mode)
+            && let Some(entry) = &cache_entry
+        {
+            write_cache_entry(entry, &text)?;
         }
+        Ok(text)
     }
 
     async fn get_text_once(&self, url: &str, rss: bool) -> Result<String> {
@@ -462,6 +517,17 @@ impl RedditClient {
         tokio::time::sleep(jitter(self.request_delay)).await;
     }
 
+    fn cache_entry(&self, url: &str, rss: bool) -> PathBuf {
+        let mode = if rss { "rss" } else { "json" };
+        let auth = if self.cookie.is_some() && !self.force_anon {
+            "cookie"
+        } else {
+            "anon"
+        };
+        let key = cache_key(&format!("{mode}:{auth}:{url}"));
+        self.cache_dir.join(format!("{key}.body"))
+    }
+
     async fn sleep_retry_after(&self, error: &anyhow::Error) {
         let seconds = error
             .downcast_ref::<RdtError>()
@@ -488,6 +554,40 @@ fn is_retryable_rate_limit(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RdtError>()
         .is_some_and(|error| matches!(error, RdtError::HttpStatus { status: 429, .. }))
+}
+
+fn should_read_cache(fresh: bool, cache_mode: CacheMode) -> bool {
+    !fresh && cache_mode == CacheMode::Use
+}
+
+fn should_write_cache(cache_mode: CacheMode) -> bool {
+    cache_mode == CacheMode::Use
+}
+
+fn cache_key(input: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn read_cache_entry(path: &Path, ttl: Duration) -> Result<Option<String>> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(None);
+    };
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    if modified.elapsed().unwrap_or(Duration::MAX) > ttl {
+        return Ok(None);
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .with_context(|| format!("reading HTTP cache {}", path.display()))
+}
+
+fn write_cache_entry(path: &Path, text: &str) -> Result<()> {
+    let parent = path.parent().context("cache path has no parent")?;
+    fs::create_dir_all(parent)?;
+    fs::write(path, text).with_context(|| format!("writing HTTP cache {}", path.display()))?;
+    Ok(())
 }
 
 fn build_url(path: &str, params: &[(&str, &str)]) -> Result<String> {
@@ -661,6 +761,7 @@ fn jitter(delay: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{thread, time::Duration};
 
     #[test]
     fn maps_bare_post_ids_to_comments_endpoint() {
@@ -724,5 +825,46 @@ mod tests {
         assert!(validate_fullname("abc123").is_err());
         assert!(validate_fullname("t9_abc123").is_err());
         assert!(validate_fullname("t3_not/valid").is_err());
+    }
+
+    #[test]
+    fn cache_key_does_not_expose_url_text() {
+        let url = "https://www.reddit.com/r/rust/new.json?raw_json=1";
+        let key = cache_key(url);
+        assert!(!key.contains("reddit"));
+        assert!(!key.contains("rust"));
+        assert_eq!(key.len(), 16);
+    }
+
+    #[test]
+    fn cache_policy_handles_fresh_and_bypass() {
+        assert!(should_read_cache(false, CacheMode::Use));
+        assert!(!should_read_cache(true, CacheMode::Use));
+        assert!(!should_read_cache(false, CacheMode::Bypass));
+        assert!(should_write_cache(CacheMode::Use));
+        assert!(!should_write_cache(CacheMode::Bypass));
+    }
+
+    #[test]
+    fn cache_entry_reads_hits_and_ignores_stale_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "rdt-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let entry = root.join("entry.body");
+        write_cache_entry(&entry, "cached body").unwrap();
+
+        assert_eq!(
+            read_cache_entry(&entry, Duration::from_secs(60)).unwrap(),
+            Some("cached body".to_owned())
+        );
+
+        thread::sleep(Duration::from_millis(2));
+        assert_eq!(read_cache_entry(&entry, Duration::ZERO).unwrap(), None);
+        let _ = fs::remove_dir_all(root);
     }
 }

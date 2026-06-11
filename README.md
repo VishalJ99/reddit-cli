@@ -11,7 +11,7 @@ See [DESIGN.md](DESIGN.md) for the full system design.
 This is the bootstrap implementation for the public project:
 
 - `rdt search`, `rdt browse`, `rdt thread`, `rdt thread --all`, `rdt comment`, `rdt subs`, `rdt sub`, and `rdt user` are wired through the transport/parser/rendering stack.
-- Transport selection supports configured cookie JSON, anonymous JSON, and `--rss` degraded mode. JSON edge-block detection falls back to RSS where a corresponding feed exists.
+- Transport selection supports configured cookie JSON, anonymous JSON, and `--rss` degraded mode. JSON edge-block detection falls back to RSS where a corresponding feed exists, and ordinary read GETs are cached for repeated browsing.
 - `rdt copy`, `rdt open`, `rdt save`, `rdt saved`, `rdt watch add/rm/ls`, and `rdt db path/query/search` are scaffolded on local XDG state.
 - The SQLite schema from the design is present with watches, posts, comments, sync log, saved links, and FTS tables.
 - `rdt sync` populates posts and comments for active watches or explicit `--sub` targets, and `rdt sync --refresh` hydrates recent stored posts through `/api/info.json`. `rdt pull` deep-captures a selected post into SQLite using the same read-only thread resolver.
@@ -81,6 +81,7 @@ cookie = "reddit_session_value_only"
 - Config: `config.toml`
 - Database: `rdt.db`
 - Last numbered results: `last.json`
+- HTTP cache: `http/`
 
 Use:
 
@@ -99,6 +100,8 @@ rdt saved
 `rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`). `--refresh` also hydrates recent stored posts for each synced subreddit; it uses the same caps and logs `kind = refresh`.
 
 `rdt pull` is the heavier path for an interesting post. It expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`.
+
+Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, and other sync-engine requests bypass this cache by design. Set `cache_ttl_secs` in `config.toml` to override the TTL.
 
 ## Read-Only Boundary
 
