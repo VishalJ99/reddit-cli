@@ -197,11 +197,7 @@ async fn sync_refresh_inner(
     progress: &mut SyncProgress,
 ) -> Result<SyncStreamReport> {
     let max_items = command.budget.max(1) as usize;
-    let page_cap = command
-        .pages
-        .map(|pages| pages.max(1) as usize)
-        .unwrap_or_else(|| max_items.div_ceil(100).max(1));
-    let request_limit = max_items.min(page_cap.saturating_mul(100));
+    let request_limit = refresh_request_limit(command, max_items);
     let total_candidates = store::post_count(paths, subreddit)?;
     let candidates = store::recent_post_fullnames(paths, subreddit, request_limit)?;
     let remaining_items = total_candidates.saturating_sub(candidates.len());
@@ -228,6 +224,14 @@ async fn sync_refresh_inner(
     })
 }
 
+fn refresh_request_limit(command: &SyncCommand, max_items: usize) -> usize {
+    let page_cap = command
+        .pages
+        .map(|pages| pages.max(1) as usize)
+        .unwrap_or_else(|| max_items.div_ceil(100).max(1));
+    max_items.min(page_cap.saturating_mul(100))
+}
+
 fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
     page.items
         .iter()
@@ -238,4 +242,37 @@ fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
             StreamKind::Refresh => false,
         })
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_limit_uses_budget_as_hard_cap() {
+        let command = command(250, Some(10));
+        assert_eq!(
+            refresh_request_limit(&command, command.budget as usize),
+            250
+        );
+    }
+
+    #[test]
+    fn refresh_limit_uses_pages_as_batch_cap() {
+        let command = command(500, Some(2));
+        assert_eq!(
+            refresh_request_limit(&command, command.budget as usize),
+            200
+        );
+    }
+
+    fn command(budget: u32, pages: Option<u32>) -> SyncCommand {
+        SyncCommand {
+            subreddits: Vec::new(),
+            pages,
+            loop_secs: None,
+            budget,
+            refresh: true,
+        }
+    }
 }

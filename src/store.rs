@@ -924,6 +924,34 @@ mod tests {
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 
+    #[test]
+    fn append_sync_log_records_refresh_reports() {
+        let paths = temp_paths();
+        let report = SyncStreamReport {
+            subreddit: "RUST".to_owned(),
+            kind: StreamKind::Refresh,
+            new_items: 0,
+            updated_items: 5,
+            http_requests: 1,
+            status: "gap".to_owned(),
+            remaining_items: Some(3),
+            notice: Some("refresh capped".to_owned()),
+        };
+
+        append_sync_log(&paths, &report, 10, 20, None).unwrap();
+        let rows = query(
+            &paths,
+            "SELECT subreddit, kind, updated_items, http_requests, status FROM sync_log",
+        )
+        .unwrap();
+        assert_eq!(rows[0].get("subreddit"), Some(&json!("rust")));
+        assert_eq!(rows[0].get("kind"), Some(&json!("refresh")));
+        assert_eq!(rows[0].get("updated_items"), Some(&json!(5)));
+        assert_eq!(rows[0].get("http_requests"), Some(&json!(1)));
+        assert_eq!(rows[0].get("status"), Some(&json!("gap")));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
     fn temp_paths() -> Paths {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

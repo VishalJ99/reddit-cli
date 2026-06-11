@@ -118,14 +118,19 @@ pub fn print_sync_reports(reports: &[SyncStreamReport], json: bool) -> Result<()
     }
 
     for report in reports {
+        let remaining = report
+            .remaining_items
+            .map(|count| format!(", {count} remaining"))
+            .unwrap_or_default();
         println!(
-            "r/{} {}: {} new, {} updated, {} request(s), {}",
+            "r/{} {}: {} new, {} updated, {} request(s), {}{}",
             report.subreddit,
             report.kind.as_str(),
             report.new_items,
             report.updated_items,
             report.http_requests,
-            report.status
+            report.status,
+            remaining
         );
         if let Some(notice) = &report.notice {
             println!("  {notice}");
