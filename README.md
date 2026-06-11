@@ -101,7 +101,7 @@ rdt saved
 
 `rdt pull` is the heavier path for an interesting post. It expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`.
 
-Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, and other sync-engine requests bypass this cache by design. Set `cache_ttl_secs` in `config.toml` to override the TTL.
+Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, auth checks, and pull/backfill capture bypass this cache by design. Cache keys separate anonymous reads from each configured cookie identity without writing cookies or raw URLs into filenames. Set `cache_ttl_secs` in `config.toml` to override the TTL.
 
 ## Read-Only Boundary
 

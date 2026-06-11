@@ -6,9 +6,9 @@
 
 ## Decision
 
-Cache ordinary read GET response bodies under the XDG cache directory at `http/`, using a hashed cache filename derived from response mode, auth mode, and URL. The default TTL is 300 seconds and can be overridden with `cache_ttl_secs` in `config.toml`.
+Cache ordinary read GET response bodies under the XDG cache directory at `http/`, using a SHA-256 hashed cache filename derived from response mode, cookie identity, and URL. Cookie identity is represented only as a hash inside the final hashed key input. The default TTL is 300 seconds and can be overridden with `cache_ttl_secs` in `config.toml`.
 
-`--fresh` bypasses cache reads but still writes the new successful response. Sync listing and `/api/info` refresh hydration use uncached transport paths.
+`--fresh` bypasses cache reads but still writes the new successful response. Sync listing, `/api/info` refresh hydration, auth checks, and pull/backfill thread capture use uncached transport paths.
 
 ## Consequences
 

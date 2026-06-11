@@ -116,7 +116,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 sort: command.sort,
                 max_requests: command.max_requests,
             };
-            let thread = client.thread(&thread_command, &target).await?;
+            let thread = client.thread_uncached(&thread_command, &target).await?;
             if thread.degraded {
                 anyhow::bail!(
                     "rdt pull requires JSON parent metadata; RSS degraded thread output was not written"

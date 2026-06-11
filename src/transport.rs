@@ -8,10 +8,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::hash_map::DefaultHasher,
     fs,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -185,6 +184,25 @@ impl RedditClient {
     }
 
     pub async fn thread(&self, command: &ThreadCommand, target: &str) -> Result<ThreadView> {
+        self.thread_with_cache(command, target, CacheMode::Use)
+            .await
+    }
+
+    pub async fn thread_uncached(
+        &self,
+        command: &ThreadCommand,
+        target: &str,
+    ) -> Result<ThreadView> {
+        self.thread_with_cache(command, target, CacheMode::Bypass)
+            .await
+    }
+
+    async fn thread_with_cache(
+        &self,
+        command: &ThreadCommand,
+        target: &str,
+        cache_mode: CacheMode,
+    ) -> Result<ThreadView> {
         let json_path = target_to_path(target, "json")?;
         let rss_path = target_to_path(target, "rss")?;
         if self.force_rss {
@@ -203,10 +221,13 @@ impl RedditClient {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
 
-        match self.get_json(&json_path, &params).await {
+        match self
+            .get_json_with_cache(&json_path, &params, cache_mode)
+            .await
+        {
             Ok(value) => {
                 if command.all {
-                    self.resolve_thread_all(command, value).await
+                    self.resolve_thread_all(command, value, cache_mode).await
                 } else {
                     let mut thread = parse::parse_thread(&value, None);
                     thread.http_requests = 1;
@@ -237,7 +258,7 @@ impl RedditClient {
         if self.cookie.is_none() {
             return Err(RdtError::CookieMissing.into());
         }
-        let value = self.get_json("/api/me.json", &[]).await?;
+        let value = self.get_json_uncached("/api/me.json", &[]).await?;
         let name = value
             .pointer("/data/name")
             .and_then(Value::as_str)
@@ -250,6 +271,7 @@ impl RedditClient {
         &self,
         command: &ThreadCommand,
         initial: Value,
+        cache_mode: CacheMode,
     ) -> Result<ThreadView> {
         let mut accumulator = ThreadAccumulator::new(parse::parse_thread_capture(&initial));
         let mut http_requests = 1usize;
@@ -273,7 +295,9 @@ impl RedditClient {
                     .context("cannot fetch continue-thread subtree without post permalink")?;
                 let permalink_path = target_to_path(&permalink, "json")?;
                 let subtree_path = thread_subtree_path(&permalink_path, parent_short_id);
-                let value = self.get_thread_json_path(&subtree_path, command).await?;
+                let value = self
+                    .get_thread_json_path(&subtree_path, command, cache_mode)
+                    .await?;
                 http_requests += 1;
                 accumulator.add_capture(parse::parse_thread_capture(&value));
                 continue;
@@ -292,7 +316,7 @@ impl RedditClient {
 
                 let end = (start + 100).min(stub.children.len());
                 let value = self
-                    .morechildren_json(&link_id, &stub.children[start..end], command)
+                    .morechildren_json(&link_id, &stub.children[start..end], command, cache_mode)
                     .await?;
                 http_requests += 1;
                 let post_id = accumulator.post_id().map(ToOwned::to_owned);
@@ -303,7 +327,12 @@ impl RedditClient {
         Ok(accumulator.into_view(http_requests, truncated))
     }
 
-    async fn get_thread_json_path(&self, path: &str, command: &ThreadCommand) -> Result<Value> {
+    async fn get_thread_json_path(
+        &self,
+        path: &str,
+        command: &ThreadCommand,
+        cache_mode: CacheMode,
+    ) -> Result<Value> {
         let mut owned = vec![
             ("sort".to_owned(), command.sort.as_reddit().to_owned()),
             ("limit".to_owned(), "500".to_owned()),
@@ -315,7 +344,7 @@ impl RedditClient {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        self.get_json(path, &params).await
+        self.get_json_with_cache(path, &params, cache_mode).await
     }
 
     async fn morechildren_json(
@@ -323,6 +352,7 @@ impl RedditClient {
         link_id: &str,
         children: &[String],
         command: &ThreadCommand,
+        cache_mode: CacheMode,
     ) -> Result<Value> {
         let children = children.join(",");
         let params = [
@@ -331,7 +361,8 @@ impl RedditClient {
             ("children", children.as_str()),
             ("sort", command.sort.as_reddit()),
         ];
-        self.get_json("/api/morechildren.json", &params).await
+        self.get_json_with_cache("/api/morechildren.json", &params, cache_mode)
+            .await
     }
 
     async fn fetch_listing_with_fallback(
@@ -519,10 +550,12 @@ impl RedditClient {
 
     fn cache_entry(&self, url: &str, rss: bool) -> PathBuf {
         let mode = if rss { "rss" } else { "json" };
-        let auth = if self.cookie.is_some() && !self.force_anon {
-            "cookie"
+        let auth = if let Some(cookie) = self.cookie.as_deref()
+            && !self.force_anon
+        {
+            format!("cookie:{}", cache_key(cookie))
         } else {
-            "anon"
+            "anon".to_owned()
         };
         let key = cache_key(&format!("{mode}:{auth}:{url}"));
         self.cache_dir.join(format!("{key}.body"))
@@ -565,9 +598,8 @@ fn should_write_cache(cache_mode: CacheMode) -> bool {
 }
 
 fn cache_key(input: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let digest = Sha256::digest(input.as_bytes());
+    format!("{digest:x}")
 }
 
 fn read_cache_entry(path: &Path, ttl: Duration) -> Result<Option<String>> {
@@ -761,7 +793,8 @@ fn jitter(delay: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread, time::Duration};
+    use crate::cli::{Cli, Commands, SearchCommand, SearchSort, TimeWindow};
+    use std::{path::Path, thread, time::Duration};
 
     #[test]
     fn maps_bare_post_ids_to_comments_endpoint() {
@@ -833,7 +866,41 @@ mod tests {
         let key = cache_key(url);
         assert!(!key.contains("reddit"));
         assert!(!key.contains("rust"));
-        assert_eq!(key.len(), 16);
+        assert_eq!(key.len(), 64);
+    }
+
+    #[test]
+    fn cache_entries_are_isolated_by_cookie_fingerprint() {
+        let root = std::env::temp_dir().join(format!(
+            "rdt-cache-client-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = test_paths(&root);
+        let cli = test_cli(false, false);
+        let config_a = Config {
+            cookie: Some("cookie-a-secret".to_owned()),
+            ..Config::default()
+        };
+        let config_b = Config {
+            cookie: Some("cookie-b-secret".to_owned()),
+            ..Config::default()
+        };
+        let client_a = RedditClient::new(&config_a, &paths, &cli).unwrap();
+        let client_b = RedditClient::new(&config_b, &paths, &cli).unwrap();
+        let url = "https://www.reddit.com/api/me.json?raw_json=1";
+        let entry_a = client_a.cache_entry(url, false);
+        let entry_b = client_b.cache_entry(url, false);
+
+        assert_ne!(entry_a, entry_b);
+        let entry_text = entry_a.to_string_lossy();
+        assert!(!entry_text.contains("cookie-a-secret"));
+        assert!(!entry_text.contains("reddit"));
+        assert!(!entry_text.contains("api/me"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -866,5 +933,33 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         assert_eq!(read_cache_entry(&entry, Duration::ZERO).unwrap(), None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_cli(anon: bool, fresh: bool) -> Cli {
+        Cli {
+            json: false,
+            fresh,
+            anon,
+            rss: false,
+            no_color: true,
+            command: Commands::Search(SearchCommand {
+                query: "rust".to_owned(),
+                subreddits: Vec::new(),
+                sort: SearchSort::Relevance,
+                time: TimeWindow::All,
+                limit: 1,
+                local: false,
+            }),
+        }
+    }
+
+    fn test_paths(root: &Path) -> Paths {
+        Paths {
+            config_file: root.join("config.toml"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            db_file: root.join("data").join("rdt.db"),
+            last_file: root.join("cache").join("last.json"),
+        }
     }
 }
