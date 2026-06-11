@@ -208,10 +208,8 @@ pub struct DigestCommand {
     pub since: Option<String>,
     #[arg(long)]
     pub sub: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Force Markdown output, overriding global --json")]
     pub md: bool,
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -244,6 +242,39 @@ fn refresh_flag_override(refresh: bool, no_refresh: bool) -> Option<bool> {
         Some(true)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn digest_accepts_global_json_after_subcommand() {
+        let cli = Cli::try_parse_from(["rdt", "digest", "--json", "--since", "24h"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Commands::Digest(command) => {
+                assert_eq!(command.since.as_deref(), Some("24h"));
+                assert!(!command.md);
+            }
+            _ => panic!("expected digest command"),
+        }
+    }
+
+    #[test]
+    fn digest_md_overrides_global_json_when_both_parse() {
+        let cli =
+            Cli::try_parse_from(["rdt", "--json", "digest", "--md", "--since", "24h"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Commands::Digest(command) => {
+                assert!(command.md);
+                assert_eq!(command.since.as_deref(), Some("24h"));
+            }
+            _ => panic!("expected digest command"),
+        }
     }
 }
 

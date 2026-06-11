@@ -116,6 +116,52 @@ pub struct ThreadView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Digest {
+    pub generated_utc: i64,
+    pub since_utc: i64,
+    pub subreddit: Option<String>,
+    pub posts: Vec<DigestPost>,
+    pub orphan_comments: Vec<DigestComment>,
+}
+
+impl Digest {
+    pub fn comment_count(&self) -> usize {
+        self.posts
+            .iter()
+            .map(|post| post.comments.len())
+            .sum::<usize>()
+            + self.orphan_comments.len()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DigestPost {
+    pub id: String,
+    pub subreddit: Option<String>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub permalink: Option<String>,
+    pub score: Option<i64>,
+    pub num_comments: Option<i64>,
+    pub created_utc: Option<i64>,
+    pub activity_utc: i64,
+    pub comments: Vec<DigestComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DigestComment {
+    pub id: String,
+    pub post_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub subreddit: Option<String>,
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub score: Option<i64>,
+    pub created_utc: Option<i64>,
+    pub permalink: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum DbValue {
     Null,

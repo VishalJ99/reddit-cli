@@ -95,6 +95,8 @@ rdt sync --sub rust --budget 300
 rdt sync --sub rust --refresh --budget 100
 rdt sync --sub rust --budget 500 --pages 5
 rdt pull 1 --max-requests 10
+rdt digest --since 24h --sub rust
+rdt digest --since 24h --sub rust --json
 rdt save 1 --note "worth reading later"
 rdt saved
 ```
@@ -104,6 +106,15 @@ rdt saved
 The intended capture pattern is broad and cheap first, then selective depth. A watch polls `/new` and `/comments`, which is enough for the mostly-flat activity across a subreddit. For an interesting post, use `rdt pull N` from the last listing or `rdt pull URL --max-requests 50` for an arbitrary thread URL. `rdt pull` expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`. Arbitrary listing URL watches are not part of the current schema; ongoing watches stay subreddit-scoped.
 
 Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, auth checks, and pull/backfill capture bypass this cache by design. Cache keys separate anonymous reads from each configured cookie identity without writing cookies or raw URLs into filenames. Set `cache_ttl_secs` in `config.toml` to override the TTL.
+
+`rdt digest` reads only the local SQLite database. It emits grouped post/comment activity as compact Markdown by default, or structured JSON with `--json`, so an LLM can summarize recent captured activity without scraping Reddit's UI:
+
+```sh
+rdt sync --sub programming --refresh
+rdt digest --since 24h --sub programming | claude -p "Summarize and flag the threads most worth opening."
+```
+
+Digest output is bounded for terminal and prompt use: up to 50 post groups, 10 comments per post, and 25 comments whose post is not present locally. Use `rdt db query ... --json` for exhaustive exports.
 
 ## Read-Only Boundary
 

@@ -1,9 +1,9 @@
 use crate::{
     config::Paths,
-    model::{DbRow, ItemKind, RedditItem, ThreadView},
+    model::{DbRow, Digest, DigestComment, DigestPost, ItemKind, RedditItem, ThreadView},
 };
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::{
     fs,
@@ -12,6 +12,9 @@ use std::{
 
 const SCHEMA: &str = include_str!("store/schema.sql");
 const SCHEMA_VERSION: i64 = 2;
+const DIGEST_POST_LIMIT: i64 = 50;
+const DIGEST_COMMENTS_PER_POST_LIMIT: i64 = 10;
+const DIGEST_ORPHAN_COMMENT_LIMIT: i64 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -217,26 +220,171 @@ pub fn saved(paths: &Paths) -> Result<Vec<DbRow>> {
     )
 }
 
-pub fn digest_rows(paths: &Paths, since: Option<&str>, sub: Option<&str>) -> Result<Vec<DbRow>> {
+pub fn digest(paths: &Paths, since: Option<&str>, sub: Option<&str>) -> Result<Digest> {
     let cutoff = since.map(parse_since).transpose()?.unwrap_or(0);
-    let conn = open(paths)?;
-    let mut sql = "SELECT 'post' AS kind, subreddit, title, permalink, created_utc FROM posts WHERE created_utc >= ?1".to_owned();
-    if sub.is_some() {
-        sql.push_str(" AND subreddit = ?2");
+    let subreddit = sub.map(validate_subreddit).transpose()?;
+    if !paths.db_file.exists() {
+        return Ok(Digest {
+            generated_utc: now_utc(),
+            since_utc: cutoff,
+            subreddit,
+            posts: Vec::new(),
+            orphan_comments: Vec::new(),
+        });
     }
-    sql.push_str(" ORDER BY created_utc DESC LIMIT 100");
+
+    let conn = open_readonly(paths)?;
+    let mut posts = digest_posts(&conn, cutoff, subreddit.as_deref())?;
+    for post in &mut posts {
+        post.comments = digest_comments_for_post(&conn, &post.id, cutoff)?;
+    }
+    let orphan_comments = digest_orphan_comments(&conn, cutoff, subreddit.as_deref())?;
+
+    Ok(Digest {
+        generated_utc: now_utc(),
+        since_utc: cutoff,
+        subreddit,
+        posts,
+        orphan_comments,
+    })
+}
+
+fn digest_posts(conn: &Connection, cutoff: i64, sub: Option<&str>) -> Result<Vec<DigestPost>> {
+    let mut sql = "
+        SELECT
+            p.id,
+            p.subreddit,
+            p.title,
+            p.author,
+            p.permalink,
+            p.score,
+            p.num_comments,
+            p.created_utc,
+            COALESCE(MAX(COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0)), 0) AS latest_comment_utc,
+            CASE
+              WHEN COALESCE(MAX(COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0)), 0)
+                   > COALESCE(p.created_utc, p.first_seen_utc, p.last_updated_utc, 0)
+              THEN COALESCE(MAX(COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0)), 0)
+              ELSE COALESCE(p.created_utc, p.first_seen_utc, p.last_updated_utc, 0)
+            END AS activity_utc
+        FROM posts p
+        LEFT JOIN comments c
+          ON c.post_id = p.id
+         AND COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0) >= ?1
+        WHERE (
+            COALESCE(p.created_utc, p.first_seen_utc, p.last_updated_utc, 0) >= ?1
+            OR c.id IS NOT NULL
+        )"
+    .to_owned();
+    if sub.is_some() {
+        sql.push_str(" AND p.subreddit = ?2");
+    }
+    let limit_param = if sub.is_some() { "?3" } else { "?2" };
+    sql.push_str(&format!(
+        "
+        GROUP BY p.id
+        ORDER BY activity_utc DESC,
+                 COALESCE(p.created_utc, p.first_seen_utc, p.last_updated_utc, 0) DESC,
+                 p.id ASC
+        LIMIT {limit_param}",
+    ));
 
     let mut stmt = conn.prepare(&sql)?;
-    let names = column_names(&stmt);
+    let map_post = |row: &rusqlite::Row<'_>| {
+        Ok(DigestPost {
+            id: row.get(0)?,
+            subreddit: row.get(1)?,
+            title: row.get(2)?,
+            author: row.get(3)?,
+            permalink: row.get(4)?,
+            score: row.get(5)?,
+            num_comments: row.get(6)?,
+            created_utc: row.get(7)?,
+            activity_utc: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+            comments: Vec::new(),
+        })
+    };
     let rows = if let Some(subreddit) = sub {
-        rows_to_json(
-            stmt.query(params![cutoff, clean_subreddit(subreddit)])?,
-            &names,
+        stmt.query_map(params![cutoff, subreddit, DIGEST_POST_LIMIT], map_post)?
+    } else {
+        stmt.query_map(params![cutoff, DIGEST_POST_LIMIT], map_post)?
+    };
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn digest_comments_for_post(
+    conn: &Connection,
+    post_id: &str,
+    cutoff: i64,
+) -> Result<Vec<DigestComment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, post_id, parent_id, subreddit, author, body, score, created_utc, permalink
+         FROM comments
+         WHERE post_id = ?1
+           AND COALESCE(created_utc, first_seen_utc, last_updated_utc, 0) >= ?2
+         ORDER BY COALESCE(score, 0) DESC,
+                  COALESCE(created_utc, first_seen_utc, last_updated_utc, 0) DESC,
+                  id ASC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![post_id, cutoff, DIGEST_COMMENTS_PER_POST_LIMIT],
+        digest_comment_from_row,
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn digest_orphan_comments(
+    conn: &Connection,
+    cutoff: i64,
+    sub: Option<&str>,
+) -> Result<Vec<DigestComment>> {
+    let mut sql = "
+        SELECT c.id, c.post_id, c.parent_id, c.subreddit, c.author, c.body, c.score, c.created_utc, c.permalink
+        FROM comments c
+        LEFT JOIN posts p ON p.id = c.post_id
+        WHERE p.id IS NULL
+          AND COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0) >= ?1"
+        .to_owned();
+    if sub.is_some() {
+        sql.push_str(" AND c.subreddit = ?2");
+    }
+    let limit_param = if sub.is_some() { "?3" } else { "?2" };
+    sql.push_str(&format!(
+        "
+        ORDER BY COALESCE(c.score, 0) DESC,
+                 COALESCE(c.created_utc, c.first_seen_utc, c.last_updated_utc, 0) DESC,
+                 c.id ASC
+        LIMIT {limit_param}",
+    ));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = if let Some(subreddit) = sub {
+        stmt.query_map(
+            params![cutoff, subreddit, DIGEST_ORPHAN_COMMENT_LIMIT],
+            digest_comment_from_row,
         )?
     } else {
-        rows_to_json(stmt.query(params![cutoff])?, &names)?
+        stmt.query_map(
+            params![cutoff, DIGEST_ORPHAN_COMMENT_LIMIT],
+            digest_comment_from_row,
+        )?
     };
-    Ok(rows)
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn digest_comment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DigestComment> {
+    Ok(DigestComment {
+        id: row.get(0)?,
+        post_id: row.get(1)?,
+        parent_id: row.get(2)?,
+        subreddit: row.get(3)?,
+        author: row.get(4)?,
+        body: row.get(5)?,
+        score: row.get(6)?,
+        created_utc: row.get(7)?,
+        permalink: row.get(8)?,
+    })
 }
 
 pub fn query(paths: &Paths, sql: &str) -> Result<Vec<DbRow>> {
@@ -491,6 +639,13 @@ fn open(paths: &Paths) -> Result<Connection> {
          UPDATE posts SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);
          UPDATE comments SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);",
     )?;
+    Ok(conn)
+}
+
+fn open_readonly(paths: &Paths) -> Result<Connection> {
+    let conn = Connection::open_with_flags(&paths.db_file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {} read-only", paths.db_file.display()))?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
     Ok(conn)
 }
 
@@ -758,14 +913,40 @@ fn parse_since(value: &str) -> Result<i64> {
     let now = now_utc();
     let trimmed = value.trim();
     if let Some(hours) = trimmed.strip_suffix('h') {
-        let hours: i64 = hours.parse()?;
-        return Ok(now - hours * 60 * 60);
+        let hours = parse_positive_duration(hours, value)?;
+        let seconds = hours
+            .checked_mul(60 * 60)
+            .context("relative --since value is too large")?;
+        return now
+            .checked_sub(seconds)
+            .context("relative --since value is before supported epoch");
     }
     if let Some(days) = trimmed.strip_suffix('d') {
-        let days: i64 = days.parse()?;
-        return Ok(now - days * 24 * 60 * 60);
+        let days = parse_positive_duration(days, value)?;
+        let seconds = days
+            .checked_mul(24 * 60 * 60)
+            .context("relative --since value is too large")?;
+        return now
+            .checked_sub(seconds)
+            .context("relative --since value is before supported epoch");
     }
-    Ok(trimmed.parse()?)
+    let epoch: i64 = trimmed
+        .parse()
+        .with_context(|| format!("invalid --since value: {value}"))?;
+    if epoch < 0 {
+        anyhow::bail!("--since epoch must be non-negative: {value}");
+    }
+    Ok(epoch)
+}
+
+fn parse_positive_duration(raw: &str, original: &str) -> Result<i64> {
+    let value: i64 = raw
+        .parse()
+        .with_context(|| format!("invalid --since value: {original}"))?;
+    if value <= 0 {
+        anyhow::bail!("relative --since value must be positive: {original}");
+    }
+    Ok(value)
 }
 
 fn clean_subreddit(input: &str) -> String {
@@ -1234,6 +1415,151 @@ mod tests {
     }
 
     #[test]
+    fn digest_groups_posts_and_recent_comments() {
+        let paths = temp_paths();
+        let mut old_post = test_post("old");
+        old_post.title = Some("Older thread with new replies".to_owned());
+        old_post.created_utc = Some(10.0);
+        old_post.num_comments = Some(3);
+        let mut new_post = test_post("new");
+        new_post.title = Some("Fresh post".to_owned());
+        new_post.created_utc = Some(60.0);
+        let mut other_sub = test_post("other");
+        other_sub.subreddit = Some("python".to_owned());
+        other_sub.created_utc = Some(70.0);
+
+        upsert_items(&paths, "rust", StreamKind::Posts, &[old_post, new_post]).unwrap();
+        upsert_items(&paths, "python", StreamKind::Posts, &[other_sub]).unwrap();
+
+        let mut high = test_comment("high", "t3_old");
+        high.post_id = Some("old".to_owned());
+        high.body = Some("important reply".to_owned());
+        high.score = Some(9);
+        high.created_utc = Some(45.0);
+        high.permalink = Some("/r/rust/comments/old/post/high/".to_owned());
+        let mut low = test_comment("low", "t3_old");
+        low.post_id = Some("old".to_owned());
+        low.body = Some("lower score reply".to_owned());
+        low.score = Some(1);
+        low.created_utc = Some(50.0);
+        low.permalink = Some("/r/rust/comments/old/post/low/".to_owned());
+        let mut stale = test_comment("stale", "t3_old");
+        stale.post_id = Some("old".to_owned());
+        stale.score = Some(99);
+        stale.created_utc = Some(20.0);
+        let mut orphan = test_comment("orphan", "t3_missing");
+        orphan.post_id = Some("missing".to_owned());
+        orphan.body = Some("orphan reply".to_owned());
+        orphan.score = Some(5);
+        orphan.created_utc = Some(55.0);
+        orphan.permalink = Some("/r/rust/comments/missing/post/orphan/".to_owned());
+        let mut other_comment = test_comment("py", "t3_other");
+        other_comment.subreddit = Some("python".to_owned());
+        other_comment.post_id = Some("other".to_owned());
+        other_comment.created_utc = Some(80.0);
+
+        upsert_items(
+            &paths,
+            "rust",
+            StreamKind::Comments,
+            &[high, low, stale, orphan],
+        )
+        .unwrap();
+        upsert_items(&paths, "python", StreamKind::Comments, &[other_comment]).unwrap();
+
+        let digest = digest(&paths, Some("40"), Some("rust")).unwrap();
+        assert_eq!(digest.since_utc, 40);
+        assert_eq!(digest.subreddit.as_deref(), Some("rust"));
+        assert_eq!(
+            digest
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+        assert!(digest.posts[0].comments.is_empty());
+        assert_eq!(
+            digest.posts[1]
+                .comments
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high", "low"]
+        );
+        assert_eq!(digest.orphan_comments.len(), 1);
+        assert_eq!(digest.orphan_comments[0].id, "orphan");
+        assert_eq!(digest.comment_count(), 3);
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn digest_rejects_invalid_subreddit_filter() {
+        let paths = temp_paths();
+        let error = digest(&paths, Some("0"), Some("rust/new"))
+            .expect_err("path-like digest filter should be rejected")
+            .to_string();
+        assert!(error.contains("invalid subreddit name"));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn digest_missing_database_is_empty_and_does_not_create_files() {
+        let paths = temp_paths();
+        let digest = digest(&paths, Some("0"), Some("rust")).unwrap();
+        assert!(digest.posts.is_empty());
+        assert!(digest.orphan_comments.is_empty());
+        assert!(!paths.db_file.exists());
+        assert!(!paths.data_dir.exists());
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn digest_uses_stable_tiebreakers_for_bounded_output() {
+        let paths = temp_paths();
+        let mut post_b = test_post("bbb");
+        post_b.created_utc = Some(10.0);
+        let mut post_a = test_post("aaa");
+        post_a.created_utc = Some(10.0);
+        let mut comment_b = test_comment("bbb_comment", "t3_aaa");
+        comment_b.post_id = Some("aaa".to_owned());
+        comment_b.score = Some(1);
+        comment_b.created_utc = Some(20.0);
+        let mut comment_a = test_comment("aaa_comment", "t3_aaa");
+        comment_a.post_id = Some("aaa".to_owned());
+        comment_a.score = Some(1);
+        comment_a.created_utc = Some(20.0);
+
+        upsert_items(&paths, "rust", StreamKind::Posts, &[post_b, post_a]).unwrap();
+        upsert_items(
+            &paths,
+            "rust",
+            StreamKind::Comments,
+            &[comment_b, comment_a],
+        )
+        .unwrap();
+
+        let digest = digest(&paths, Some("0"), Some("rust")).unwrap();
+        assert_eq!(
+            digest
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaa", "bbb"]
+        );
+        assert_eq!(
+            digest.posts[0]
+                .comments
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaa_comment", "bbb_comment"]
+        );
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
     fn append_sync_log_records_refresh_reports() {
         let paths = temp_paths();
         let report = SyncStreamReport {
@@ -1259,6 +1585,92 @@ mod tests {
         assert_eq!(rows[0].get("http_requests"), Some(&json!(1)));
         assert_eq!(rows[0].get("status"), Some(&json!("gap")));
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn digest_groups_recent_comments_under_posts() {
+        let paths = temp_paths();
+        let mut old_post = test_post("abc");
+        old_post.created_utc = Some(10.0);
+        let mut recent_post = test_post("new");
+        recent_post.created_utc = Some(40.0);
+        recent_post.title = Some("Recent post".to_owned());
+
+        let mut top_comment = test_comment("top", "t3_abc");
+        top_comment.created_utc = Some(30.0);
+        top_comment.score = Some(10);
+        top_comment.body = Some("top recent comment".to_owned());
+        let mut lower_comment = test_comment("low", "t3_abc");
+        lower_comment.created_utc = Some(20.0);
+        lower_comment.score = Some(1);
+        lower_comment.body = Some("lower recent comment".to_owned());
+
+        upsert_items(&paths, "rust", StreamKind::Posts, &[old_post, recent_post]).unwrap();
+        upsert_items(
+            &paths,
+            "rust",
+            StreamKind::Comments,
+            &[top_comment, lower_comment],
+        )
+        .unwrap();
+
+        let digest = digest(&paths, Some("15"), None).unwrap();
+        assert_eq!(digest.posts.len(), 2);
+        assert_eq!(digest.comment_count(), 2);
+        assert_eq!(digest.posts[0].id, "new");
+        let old_group = digest.posts.iter().find(|post| post.id == "abc").unwrap();
+        assert_eq!(old_group.comments.len(), 2);
+        assert_eq!(old_group.comments[0].id, "top");
+        assert_eq!(
+            old_group.comments[0].permalink.as_deref(),
+            Some("https://www.reddit.com/r/rust/comments/abc/post/top/")
+        );
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn digest_filters_subreddit_and_keeps_orphan_comments_clear() {
+        let paths = temp_paths();
+        let mut rust_orphan = test_comment("orphan", "t3_missing");
+        rust_orphan.post_id = Some("missing".to_owned());
+        rust_orphan.created_utc = Some(30.0);
+        rust_orphan.score = Some(5);
+        let mut swift_orphan = test_comment("swift", "t3_missing2");
+        swift_orphan.post_id = Some("missing2".to_owned());
+        swift_orphan.subreddit = Some("swift".to_owned());
+        swift_orphan.created_utc = Some(40.0);
+
+        upsert_items(&paths, "rust", StreamKind::Comments, &[rust_orphan.clone()]).unwrap();
+        upsert_items(&paths, "swift", StreamKind::Comments, &[swift_orphan]).unwrap();
+
+        let rust_digest = digest(&paths, Some("24"), Some("rust")).unwrap();
+        assert!(rust_digest.posts.is_empty());
+        assert_eq!(rust_digest.subreddit.as_deref(), Some("rust"));
+        assert_eq!(rust_digest.orphan_comments.len(), 1);
+        assert_eq!(rust_digest.orphan_comments[0].id, "orphan");
+
+        let empty = digest(&paths, Some("31"), Some("rust")).unwrap();
+        assert!(empty.posts.is_empty());
+        assert!(empty.orphan_comments.is_empty());
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn parse_since_accepts_relative_hours_and_days() {
+        let now = now_utc();
+        let hour_cutoff = parse_since("1h").unwrap();
+        let day_cutoff = parse_since("1d").unwrap();
+        assert!((now - 3601..=now - 3599).contains(&hour_cutoff));
+        assert!((now - 86401..=now - 86399).contains(&day_cutoff));
+        assert_eq!(parse_since("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_since_rejects_negative_zero_and_overflowing_values() {
+        assert!(parse_since("-1").is_err());
+        assert!(parse_since("0h").is_err());
+        assert!(parse_since("-2d").is_err());
+        assert!(parse_since("999999999999999999999999999999d").is_err());
     }
 
     fn temp_paths() -> Paths {

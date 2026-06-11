@@ -15,6 +15,7 @@ The product boundary is important: the tool may search, browse, read, copy/open 
 - Refresh issue: `PER-285` (`Implement sync refresh hydration`)
 - Watch override issue: `PER-286` (`Add persistent watch overrides and targeted capture workflow`)
 - HTTP cache issue: `PER-287` (`Implement HTTP cache TTL`)
+- Digest issue: `PER-289` (`Implement LLM-ready local digest`)
 - GitHub target: `VishalJ99/reddit-cli`
 
 Commit bodies should put the ticket ID on the first body line.
@@ -32,6 +33,8 @@ cargo test
 The transport stack uses `wreq` for browser-style HTTP emulation. Building `wreq` pulls in BoringSSL and requires `cmake` to be installed on the machine.
 
 A local Reddit session cookie has been saved outside the repo at `~/Library/Application Support/rdt/config.toml` with `0600` file permissions inside a `0700` directory. Do not print the cookie. The code also supports the primary `directories` crate path under `~/Library/Application Support/com.dross.rdt/config.toml`.
+
+When smoke-testing with a temporary `HOME`, keep Cargo's cache stable. Either run `cargo build` once and then invoke `target/debug/rdt` with the temporary `HOME`, or set `CARGO_HOME=$HOME/.cargo` from the real user environment before overriding `HOME`; otherwise Cargo treats the temp home as a fresh cache and rebuilds/downloads dependencies noisily.
 
 ## Design Source
 

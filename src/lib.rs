@@ -149,9 +149,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             render::print_sync_reports(&[report], cli.json)?;
         }
         Commands::Digest(command) => {
-            let rows =
-                store::digest_rows(&paths, command.since.as_deref(), command.sub.as_deref())?;
-            render::print_digest(&rows, command.json || cli.json)?;
+            let digest = store::digest(&paths, command.since.as_deref(), command.sub.as_deref())?;
+            render::print_digest(&digest, cli.json && !command.md)?;
         }
         Commands::Db(command) => match command {
             DbCommand::Path => println!("{}", paths.db_file.display()),
