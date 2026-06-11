@@ -46,6 +46,77 @@ cargo install --path .
 rdt search "screen time api" -r swift -n 10
 ```
 
+## Agent Skill
+
+This repo ships a reusable agent skill at:
+
+```text
+.agents/skills/reddit-cli/SKILL.md
+```
+
+Use it when you want an agent to work on `reddit-cli`, operate `rdt`, run local sync/watch workflows, or preserve the project's read-only Reddit boundary.
+The `.agents/skills/reddit-cli` folder is the canonical copy; if you copy it into a tool-specific skills directory, recopy it after editing the checked-in skill.
+
+### Codex
+
+Codex reads repo skills from `.agents/skills` when launched from the repository, so no install step is required for repo-local use:
+
+```sh
+codex
+```
+
+Invoke it explicitly with `$reddit-cli`, or let Codex load it when the task matches the skill description.
+
+For a personal install across repositories:
+
+```sh
+mkdir -p ~/.agents/skills
+cp -R .agents/skills/reddit-cli ~/.agents/skills/
+```
+
+Restart Codex if the skill does not appear in the current session.
+
+### Claude Code
+
+Claude Code uses `.claude/skills` for project skills and `~/.claude/skills` for personal skills. Install the same skill project-locally with:
+
+```sh
+mkdir -p .claude/skills
+cp -R .agents/skills/reddit-cli .claude/skills/
+```
+
+Or install it for all Claude Code projects:
+
+```sh
+mkdir -p ~/.claude/skills
+cp -R .agents/skills/reddit-cli ~/.claude/skills/
+```
+
+Invoke it with `/reddit-cli`, or ask Claude Code for `reddit-cli` work that matches the skill description.
+
+### OpenClaw
+
+OpenClaw loads workspace `.agents/skills` skills, so the checked-in skill is available when this repository is the OpenClaw workspace:
+
+```sh
+cd /path/to/reddit-cli
+openclaw
+```
+
+For a personal OpenClaw install:
+
+```sh
+mkdir -p ~/.agents/skills
+cp -R .agents/skills/reddit-cli ~/.agents/skills/
+```
+
+If your OpenClaw workspace uses a top-level `skills/` directory instead, copy the skill there:
+
+```sh
+mkdir -p skills
+cp -R .agents/skills/reddit-cli skills/
+```
+
 ## Auth And Transport
 
 The transport order is:
