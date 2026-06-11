@@ -120,9 +120,49 @@ pub struct CommentCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum WatchCommand {
-    Add { subreddits: Vec<String> },
+    Add(WatchAddCommand),
+    Set(WatchSetCommand),
     Rm { subreddit: String },
     Ls,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchAddCommand {
+    #[arg(required = true)]
+    pub subreddits: Vec<String>,
+    #[arg(long, help = "Persist a page cap per stream for this watch")]
+    pub pages: Option<u32>,
+    #[arg(long, help = "Persist an item budget per stream for this watch")]
+    pub budget: Option<u32>,
+    #[arg(long, conflicts_with = "no_refresh", action = clap::ArgAction::SetTrue)]
+    pub refresh: bool,
+    #[arg(long = "no-refresh", conflicts_with = "refresh", action = clap::ArgAction::SetTrue)]
+    pub no_refresh: bool,
+}
+
+impl WatchAddCommand {
+    pub fn refresh_override(&self) -> Option<bool> {
+        refresh_flag_override(self.refresh, self.no_refresh)
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct WatchSetCommand {
+    pub subreddit: String,
+    #[arg(long, help = "Persist a page cap per stream for this watch")]
+    pub pages: Option<u32>,
+    #[arg(long, help = "Persist an item budget per stream for this watch")]
+    pub budget: Option<u32>,
+    #[arg(long, conflicts_with = "no_refresh", action = clap::ArgAction::SetTrue)]
+    pub refresh: bool,
+    #[arg(long = "no-refresh", conflicts_with = "refresh", action = clap::ArgAction::SetTrue)]
+    pub no_refresh: bool,
+}
+
+impl WatchSetCommand {
+    pub fn refresh_override(&self) -> Option<bool> {
+        refresh_flag_override(self.refresh, self.no_refresh)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -137,13 +177,18 @@ pub struct SyncCommand {
     pub pages: Option<u32>,
     #[arg(long = "loop", help = "Repeat sync every SECS seconds")]
     pub loop_secs: Option<u64>,
-    #[arg(long, default_value_t = 300, help = "Target item budget per stream")]
-    pub budget: u32,
-    #[arg(
-        long,
-        help = "Hydrate recent stored posts with /api/info after stream sync"
-    )]
+    #[arg(long, help = "Override the item budget per stream")]
+    pub budget: Option<u32>,
+    #[arg(long, conflicts_with = "no_refresh", action = clap::ArgAction::SetTrue, help = "Hydrate recent stored posts with /api/info after stream sync")]
     pub refresh: bool,
+    #[arg(long = "no-refresh", conflicts_with = "refresh", action = clap::ArgAction::SetTrue, help = "Disable refresh even if a watch or config enables it")]
+    pub no_refresh: bool,
+}
+
+impl SyncCommand {
+    pub fn refresh_override(&self) -> Option<bool> {
+        refresh_flag_override(self.refresh, self.no_refresh)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -190,6 +235,16 @@ pub enum AuthCommand {
     },
     Check,
     Clear,
+}
+
+fn refresh_flag_override(refresh: bool, no_refresh: bool) -> Option<bool> {
+    if no_refresh {
+        Some(false)
+    } else if refresh {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

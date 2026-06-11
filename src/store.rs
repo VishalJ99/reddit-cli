@@ -11,6 +11,7 @@ use std::{
 };
 
 const SCHEMA: &str = include_str!("store/schema.sql");
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -43,23 +44,103 @@ pub struct SyncStreamReport {
     pub notice: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchTarget {
+    pub subreddit: String,
+    pub page_cap: Option<u32>,
+    pub budget: Option<u32>,
+    pub refresh: Option<bool>,
+}
+
+impl WatchTarget {
+    fn new(subreddit: impl AsRef<str>) -> Self {
+        Self {
+            subreddit: clean_subreddit(subreddit.as_ref()),
+            page_cap: None,
+            budget: None,
+            refresh: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WatchOverrides {
+    pub page_cap: Option<u32>,
+    pub budget: Option<u32>,
+    pub refresh: Option<bool>,
+}
+
+impl WatchOverrides {
+    pub fn new(page_cap: Option<u32>, budget: Option<u32>, refresh: Option<bool>) -> Self {
+        Self {
+            page_cap,
+            budget,
+            refresh,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.page_cap.is_none() && self.budget.is_none() && self.refresh.is_none()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UpsertStats {
     pub new_items: usize,
     pub updated_items: usize,
 }
 
-pub fn watch_add(paths: &Paths, subreddits: &[String]) -> Result<()> {
+pub fn watch_add(paths: &Paths, subreddits: &[String], overrides: WatchOverrides) -> Result<()> {
     let conn = open(paths)?;
     let now = now_utc();
     for subreddit in subreddits {
-        let subreddit = clean_subreddit(subreddit);
+        let subreddit = validate_subreddit(subreddit)?;
         conn.execute(
-            "INSERT INTO watches (subreddit, active, added_utc) VALUES (?1, 1, ?2)
-             ON CONFLICT(subreddit) DO UPDATE SET active = 1",
-            params![subreddit, now],
+            "INSERT INTO watches (subreddit, active, added_utc, page_cap, budget, refresh)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(subreddit) DO UPDATE SET
+              active = 1,
+              page_cap = COALESCE(excluded.page_cap, watches.page_cap),
+              budget = COALESCE(excluded.budget, watches.budget),
+              refresh = COALESCE(excluded.refresh, watches.refresh)",
+            params![
+                subreddit,
+                now,
+                opt_u32_i64(overrides.page_cap),
+                opt_u32_i64(overrides.budget),
+                overrides.refresh.map(i64::from),
+            ],
         )?;
     }
+    Ok(())
+}
+
+pub fn watch_set(paths: &Paths, subreddit: &str, overrides: WatchOverrides) -> Result<()> {
+    if overrides.is_empty() {
+        anyhow::bail!(
+            "watch set needs at least one of --pages, --budget, --refresh, or --no-refresh"
+        );
+    }
+
+    let conn = open(paths)?;
+    let now = now_utc();
+    let subreddit = validate_subreddit(subreddit)?;
+    conn.execute(
+        "INSERT INTO watches (subreddit, active, added_utc, page_cap, budget, refresh)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(subreddit) DO UPDATE SET
+          active = 1,
+          page_cap = COALESCE(excluded.page_cap, watches.page_cap),
+          budget = COALESCE(excluded.budget, watches.budget),
+          refresh = COALESCE(excluded.refresh, watches.refresh)",
+        params![
+            subreddit,
+            now,
+            opt_u32_i64(overrides.page_cap),
+            opt_u32_i64(overrides.budget),
+            overrides.refresh.map(i64::from),
+        ],
+    )?;
     Ok(())
 }
 
@@ -75,16 +156,49 @@ pub fn watch_remove(paths: &Paths, subreddit: &str) -> Result<()> {
 pub fn watch_list(paths: &Paths) -> Result<Vec<DbRow>> {
     query(
         paths,
-        "SELECT subreddit, active, added_utc, last_synced_utc FROM watches ORDER BY subreddit",
+        "SELECT subreddit, active, added_utc, page_cap, budget, refresh, last_synced_utc FROM watches ORDER BY subreddit",
     )
 }
 
-pub fn active_watches(paths: &Paths) -> Result<Vec<String>> {
+pub fn sync_targets(paths: &Paths, subreddits: &[String]) -> Result<Vec<WatchTarget>> {
+    if subreddits.is_empty() {
+        active_watches(paths)
+    } else {
+        explicit_watch_targets(paths, subreddits)
+    }
+}
+
+fn active_watches(paths: &Paths) -> Result<Vec<WatchTarget>> {
     let conn = open(paths)?;
-    let mut stmt =
-        conn.prepare("SELECT subreddit FROM watches WHERE active = 1 ORDER BY subreddit")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare(
+        "SELECT subreddit, page_cap, budget, refresh
+         FROM watches
+         WHERE active = 1
+         ORDER BY subreddit",
+    )?;
+    let rows = stmt.query_map([], watch_target_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn explicit_watch_targets(paths: &Paths, subreddits: &[String]) -> Result<Vec<WatchTarget>> {
+    let conn = open(paths)?;
+    let mut stmt = conn.prepare(
+        "SELECT subreddit, page_cap, budget, refresh
+         FROM watches
+         WHERE subreddit = ?1
+           AND active = 1
+         LIMIT 1",
+    )?;
+    let mut targets = Vec::new();
+    for subreddit in subreddits {
+        let normalized = validate_subreddit(subreddit)?;
+        let target = stmt
+            .query_row(params![normalized], watch_target_from_row)
+            .optional()?
+            .unwrap_or_else(|| WatchTarget::new(&normalized));
+        targets.push(target);
+    }
+    Ok(targets)
 }
 
 pub fn save_link(paths: &Paths, permalink: &str, note: Option<&str>) -> Result<()> {
@@ -370,12 +484,52 @@ fn open(paths: &Paths) -> Result<Connection> {
     let conn = Connection::open(&paths.db_file)
         .with_context(|| format!("opening {}", paths.db_file.display()))?;
     conn.execute_batch(SCHEMA)?;
+    ensure_watch_override_columns(&conn)?;
+    set_schema_version(&conn)?;
     conn.execute_batch(
         "UPDATE watches SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);
          UPDATE posts SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);
          UPDATE comments SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);",
     )?;
     Ok(conn)
+}
+
+fn set_schema_version(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM schema_meta", [])?;
+    conn.execute(
+        "INSERT INTO schema_meta (version) VALUES (?1)",
+        params![SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+fn ensure_watch_override_columns(conn: &Connection) -> Result<()> {
+    let columns = watch_columns(conn)?;
+    for (name, definition) in [
+        ("page_cap", "page_cap INTEGER"),
+        ("budget", "budget INTEGER"),
+        ("refresh", "refresh INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute(&format!("ALTER TABLE watches ADD COLUMN {definition}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn watch_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(watches)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn watch_target_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchTarget> {
+    Ok(WatchTarget {
+        subreddit: row.get(0)?,
+        page_cap: opt_i64_u32(row.get(1)?),
+        budget: opt_i64_u32(row.get(2)?),
+        refresh: row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
+    })
 }
 
 fn upsert_post(
@@ -543,6 +697,14 @@ fn opt_bool_i64(value: Option<bool>) -> Option<i64> {
     value.map(i64::from)
 }
 
+fn opt_u32_i64(value: Option<u32>) -> Option<i64> {
+    value.map(i64::from)
+}
+
+fn opt_i64_u32(value: Option<i64>) -> Option<u32> {
+    value.and_then(|value| u32::try_from(value).ok())
+}
+
 fn opt_epoch(value: Option<f64>) -> Option<i64> {
     value.map(|value| value as i64)
 }
@@ -614,6 +776,19 @@ fn clean_subreddit(input: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn validate_subreddit(input: &str) -> Result<String> {
+    let subreddit = clean_subreddit(input);
+    if (2..=21).contains(&subreddit.len())
+        && subreddit
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Ok(subreddit)
+    } else {
+        anyhow::bail!("invalid subreddit name: {input}")
+    }
+}
+
 fn ensure_read_statement(stmt: &rusqlite::Statement<'_>) -> Result<()> {
     if stmt.readonly() {
         Ok(())
@@ -636,17 +811,151 @@ mod tests {
     #[test]
     fn initializes_and_records_watches() {
         let paths = temp_paths();
-        watch_add(&paths, &[String::from("r/rust")]).unwrap();
+        watch_add(&paths, &[String::from("r/rust")], WatchOverrides::default()).unwrap();
         let rows = watch_list(&paths).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("subreddit").unwrap(), "rust");
+        assert_eq!(
+            query(&paths, "SELECT version FROM schema_meta").unwrap()[0].get("version"),
+            Some(&json!(2))
+        );
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_watch_subreddits() {
+        let paths = temp_paths();
+        let error = watch_add(
+            &paths,
+            &[String::from("rust/new")],
+            WatchOverrides::default(),
+        )
+        .expect_err("path-like subreddit should be rejected")
+        .to_string();
+        assert!(error.contains("invalid subreddit name"));
+
+        let error = watch_set(
+            &paths,
+            "https://www.reddit.com/r/rust",
+            WatchOverrides::new(Some(1), None, None),
+        )
+        .expect_err("URL-shaped subreddit should be rejected")
+        .to_string();
+        assert!(error.contains("invalid subreddit name"));
+
+        let error = sync_targets(&paths, &[String::from("rust+programming")])
+            .expect_err("multireddit source is not a subreddit watch")
+            .to_string();
+        assert!(error.contains("invalid subreddit name"));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn records_watch_overrides_and_sync_targets() {
+        let paths = temp_paths();
+        watch_add(
+            &paths,
+            &[String::from("r/Rust")],
+            WatchOverrides::new(Some(5), Some(500), Some(true)),
+        )
+        .unwrap();
+
+        let rows = watch_list(&paths).unwrap();
+        assert_eq!(rows[0].get("subreddit"), Some(&json!("rust")));
+        assert_eq!(rows[0].get("page_cap"), Some(&json!(5)));
+        assert_eq!(rows[0].get("budget"), Some(&json!(500)));
+        assert_eq!(rows[0].get("refresh"), Some(&json!(1)));
+
+        let targets = sync_targets(&paths, &[]).unwrap();
+        assert_eq!(
+            targets,
+            vec![WatchTarget {
+                subreddit: "rust".to_owned(),
+                page_cap: Some(5),
+                budget: Some(500),
+                refresh: Some(true),
+            }]
+        );
+
+        let explicit = sync_targets(&paths, &[String::from("adhd")]).unwrap();
+        assert_eq!(explicit, vec![WatchTarget::new("adhd")]);
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn watch_set_updates_one_watch_override() {
+        let paths = temp_paths();
+        watch_set(
+            &paths,
+            "rust",
+            WatchOverrides::new(Some(7), Some(700), Some(false)),
+        )
+        .unwrap();
+
+        let target = sync_targets(&paths, &[]).unwrap().remove(0);
+        assert_eq!(target.page_cap, Some(7));
+        assert_eq!(target.budget, Some(700));
+        assert_eq!(target.refresh, Some(false));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn explicit_sync_ignores_inactive_watch_overrides() {
+        let paths = temp_paths();
+        watch_add(
+            &paths,
+            &[String::from("rust")],
+            WatchOverrides::new(Some(9), Some(900), Some(true)),
+        )
+        .unwrap();
+        watch_remove(&paths, "rust").unwrap();
+
+        let targets = sync_targets(&paths, &[String::from("rust")]).unwrap();
+        assert_eq!(targets, vec![WatchTarget::new("rust")]);
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn migrates_old_watch_tables_for_overrides() {
+        let paths = temp_paths();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let conn = Connection::open(&paths.db_file).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE watches (
+                subreddit TEXT PRIMARY KEY,
+                active INTEGER NOT NULL DEFAULT 1,
+                added_utc INTEGER NOT NULL,
+                newest_post_fullname TEXT,
+                newest_comment_fullname TEXT,
+                last_synced_utc INTEGER
+            );
+            INSERT INTO watches (subreddit, active, added_utc) VALUES ('rust', 1, 10);",
+        )
+        .unwrap();
+        drop(conn);
+
+        watch_set(
+            &paths,
+            "rust",
+            WatchOverrides::new(Some(3), Some(300), Some(true)),
+        )
+        .unwrap();
+
+        let rows = query(&paths, "SELECT page_cap, budget, refresh FROM watches").unwrap();
+        assert_eq!(rows[0].get("page_cap"), Some(&json!(3)));
+        assert_eq!(rows[0].get("budget"), Some(&json!(300)));
+        assert_eq!(rows[0].get("refresh"), Some(&json!(1)));
+        assert_eq!(
+            query(&paths, "SELECT version FROM schema_meta").unwrap()[0].get("version"),
+            Some(&json!(2))
+        );
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 
     #[test]
     fn db_query_rejects_writes() {
         let paths = temp_paths();
-        watch_add(&paths, &[String::from("rust")]).unwrap();
+        watch_add(&paths, &[String::from("rust")], WatchOverrides::default()).unwrap();
         let error = query(
             &paths,
             "WITH doomed AS (SELECT 1) DELETE FROM watches WHERE subreddit = 'rust'",

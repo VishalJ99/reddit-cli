@@ -12,7 +12,7 @@ This is the bootstrap implementation for the public project:
 
 - `rdt search`, `rdt browse`, `rdt thread`, `rdt thread --all`, `rdt comment`, `rdt subs`, `rdt sub`, and `rdt user` are wired through the transport/parser/rendering stack.
 - Transport selection supports configured cookie JSON, anonymous JSON, and `--rss` degraded mode. JSON edge-block detection falls back to RSS where a corresponding feed exists, and ordinary read GETs are cached for repeated browsing.
-- `rdt copy`, `rdt open`, `rdt save`, `rdt saved`, `rdt watch add/rm/ls`, and `rdt db path/query/search` are scaffolded on local XDG state.
+- `rdt copy`, `rdt open`, `rdt save`, `rdt saved`, `rdt watch add/set/rm/ls`, and `rdt db path/query/search` are scaffolded on local XDG state.
 - The SQLite schema from the design is present with watches, posts, comments, sync log, saved links, and FTS tables.
 - `rdt sync` populates posts and comments for active watches or explicit `--sub` targets, and `rdt sync --refresh` hydrates recent stored posts through `/api/info.json`. `rdt pull` deep-captures a selected post into SQLite using the same read-only thread resolver.
 
@@ -88,6 +88,8 @@ Use:
 ```sh
 rdt db path
 rdt watch add rust programming
+rdt watch add adhd --pages 5 --budget 500 --refresh
+rdt watch set adhd --pages 8 --budget 800
 rdt watch ls
 rdt sync --sub rust --budget 300
 rdt sync --sub rust --refresh --budget 100
@@ -97,9 +99,9 @@ rdt save 1 --note "worth reading later"
 rdt saved
 ```
 
-`rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`). `--refresh` also hydrates recent stored posts for each synced subreddit; it uses the same caps and logs `kind = refresh`.
+`rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. The subreddit comment stream is flat and newest-first but includes comments from any depth, so watch sync has no tree-depth cutoff; it is bounded by page and item caps instead. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`). CLI flags override watch settings for that run; otherwise per-watch settings override global config/defaults. `--refresh` also hydrates recent stored posts for each synced subreddit; it uses the same caps and logs `kind = refresh`.
 
-`rdt pull` is the heavier path for an interesting post. It expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`.
+The intended capture pattern is broad and cheap first, then selective depth. A watch polls `/new` and `/comments`, which is enough for the mostly-flat activity across a subreddit. For an interesting post, use `rdt pull N` from the last listing or `rdt pull URL --max-requests 50` for an arbitrary thread URL. `rdt pull` expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`. Arbitrary listing URL watches are not part of the current schema; ongoing watches stay subreddit-scoped.
 
 Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, auth checks, and pull/backfill capture bypass this cache by design. Cache keys separate anonymous reads from each configured cookie identity without writing cookies or raw URLs into filenames. Set `cache_ttl_secs` in `config.toml` to override the TTL.
 

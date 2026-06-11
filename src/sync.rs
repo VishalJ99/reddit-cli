@@ -1,11 +1,13 @@
 use crate::{
     cli::SyncCommand,
-    config::Paths,
+    config::{Config, Paths},
     model::ListingPage,
-    store::{self, StreamKind, SyncStreamReport},
+    store::{self, StreamKind, SyncStreamReport, WatchTarget},
     transport::RedditClient,
 };
 use anyhow::Result;
+
+const DEFAULT_SYNC_BUDGET: u32 = 300;
 
 #[derive(Debug, Default)]
 struct SyncProgress {
@@ -14,27 +16,38 @@ struct SyncProgress {
     http_requests: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EffectiveSyncOptions {
+    budget: usize,
+    page_cap: usize,
+    refresh: bool,
+}
+
 pub async fn run_once(
     paths: &Paths,
     client: &RedditClient,
+    config: &Config,
     command: &SyncCommand,
 ) -> Result<Vec<SyncStreamReport>> {
-    let subreddits = if command.subreddits.is_empty() {
-        store::active_watches(paths)?
-    } else {
-        command
-            .subreddits
-            .iter()
-            .map(|subreddit| store::normalize_subreddit(subreddit))
-            .collect()
-    };
+    let targets = store::sync_targets(paths, &command.subreddits)?;
 
     let mut reports = Vec::new();
-    for subreddit in subreddits {
-        reports.push(sync_stream(paths, client, &subreddit, StreamKind::Posts, command).await?);
-        reports.push(sync_stream(paths, client, &subreddit, StreamKind::Comments, command).await?);
-        if command.refresh {
-            reports.push(sync_refresh(paths, client, &subreddit, command).await?);
+    for target in targets {
+        let options = effective_options(command, config, &target);
+        reports
+            .push(sync_stream(paths, client, &target.subreddit, StreamKind::Posts, options).await?);
+        reports.push(
+            sync_stream(
+                paths,
+                client,
+                &target.subreddit,
+                StreamKind::Comments,
+                options,
+            )
+            .await?,
+        );
+        if options.refresh {
+            reports.push(sync_refresh(paths, client, &target.subreddit, options).await?);
         }
     }
     Ok(reports)
@@ -44,11 +57,11 @@ async fn sync_refresh(
     paths: &Paths,
     client: &RedditClient,
     subreddit: &str,
-    command: &SyncCommand,
+    options: EffectiveSyncOptions,
 ) -> Result<SyncStreamReport> {
     let started = store::utc_now();
     let mut progress = SyncProgress::default();
-    let result = sync_refresh_inner(paths, client, subreddit, command, &mut progress).await;
+    let result = sync_refresh_inner(paths, client, subreddit, options, &mut progress).await;
 
     match result {
         Ok(report) => {
@@ -82,11 +95,11 @@ async fn sync_stream(
     client: &RedditClient,
     subreddit: &str,
     kind: StreamKind,
-    command: &SyncCommand,
+    options: EffectiveSyncOptions,
 ) -> Result<SyncStreamReport> {
     let started = store::utc_now();
     let mut progress = SyncProgress::default();
-    let result = sync_stream_inner(paths, client, subreddit, kind, command, &mut progress).await;
+    let result = sync_stream_inner(paths, client, subreddit, kind, options, &mut progress).await;
 
     match result {
         Ok(report) => {
@@ -120,7 +133,7 @@ async fn sync_stream_inner(
     client: &RedditClient,
     subreddit: &str,
     kind: StreamKind,
-    command: &SyncCommand,
+    options: EffectiveSyncOptions,
     progress: &mut SyncProgress,
 ) -> Result<SyncStreamReport> {
     let listing = match kind {
@@ -129,11 +142,8 @@ async fn sync_stream_inner(
         StreamKind::Backfill => unreachable!("backfill is not a watch stream"),
         StreamKind::Refresh => unreachable!("refresh is not a watch stream"),
     };
-    let mut remaining = command.budget.max(1) as usize;
-    let page_cap = command
-        .pages
-        .map(|pages| pages.max(1) as usize)
-        .unwrap_or_else(|| remaining.div_ceil(100).max(1));
+    let mut remaining = options.budget;
+    let page_cap = options.page_cap;
 
     let mut after = None;
     let mut newest_fullname = None;
@@ -193,11 +203,10 @@ async fn sync_refresh_inner(
     paths: &Paths,
     client: &RedditClient,
     subreddit: &str,
-    command: &SyncCommand,
+    options: EffectiveSyncOptions,
     progress: &mut SyncProgress,
 ) -> Result<SyncStreamReport> {
-    let max_items = command.budget.max(1) as usize;
-    let request_limit = refresh_request_limit(command, max_items);
+    let request_limit = refresh_request_limit(options);
     let total_candidates = store::post_count(paths, subreddit)?;
     let candidates = store::recent_post_fullnames(paths, subreddit, request_limit)?;
     let remaining_items = total_candidates.saturating_sub(candidates.len());
@@ -224,12 +233,38 @@ async fn sync_refresh_inner(
     })
 }
 
-fn refresh_request_limit(command: &SyncCommand, max_items: usize) -> usize {
+fn effective_options(
+    command: &SyncCommand,
+    config: &Config,
+    target: &WatchTarget,
+) -> EffectiveSyncOptions {
+    let budget = command
+        .budget
+        .or(target.budget)
+        .or(config.sync_budget)
+        .unwrap_or(DEFAULT_SYNC_BUDGET)
+        .max(1) as usize;
     let page_cap = command
         .pages
+        .or(target.page_cap)
+        .or(config.page_cap)
         .map(|pages| pages.max(1) as usize)
-        .unwrap_or_else(|| max_items.div_ceil(100).max(1));
-    max_items.min(page_cap.saturating_mul(100))
+        .unwrap_or_else(|| budget.div_ceil(100).max(1));
+    let refresh = command
+        .refresh_override()
+        .or(target.refresh)
+        .or(config.sync_refresh)
+        .unwrap_or(false);
+
+    EffectiveSyncOptions {
+        budget,
+        page_cap,
+        refresh,
+    }
+}
+
+fn refresh_request_limit(options: EffectiveSyncOptions) -> usize {
+    options.budget.min(options.page_cap.saturating_mul(100))
 }
 
 fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
@@ -250,29 +285,71 @@ mod tests {
 
     #[test]
     fn refresh_limit_uses_budget_as_hard_cap() {
-        let command = command(250, Some(10));
-        assert_eq!(
-            refresh_request_limit(&command, command.budget as usize),
-            250
-        );
+        let options = options(250, 10, true);
+        assert_eq!(refresh_request_limit(options), 250);
     }
 
     #[test]
     fn refresh_limit_uses_pages_as_batch_cap() {
-        let command = command(500, Some(2));
-        assert_eq!(
-            refresh_request_limit(&command, command.budget as usize),
-            200
-        );
+        let options = options(500, 2, true);
+        assert_eq!(refresh_request_limit(options), 200);
     }
 
-    fn command(budget: u32, pages: Option<u32>) -> SyncCommand {
+    #[test]
+    fn effective_options_prefer_cli_then_watch_then_config() {
+        let command = command(Some(25), Some(1), false, false);
+        let config = Config {
+            page_cap: Some(4),
+            sync_budget: Some(400),
+            sync_refresh: Some(false),
+            ..Config::default()
+        };
+        let target = target(Some(2), Some(200), Some(true));
+        let options = effective_options(&command, &config, &target);
+        assert_eq!(options.budget, 25);
+        assert_eq!(options.page_cap, 1);
+        assert!(options.refresh);
+    }
+
+    #[test]
+    fn effective_options_allow_cli_refresh_disable() {
+        let command = command(None, None, false, true);
+        let config = Config::default();
+        let target = target(None, None, Some(true));
+        let options = effective_options(&command, &config, &target);
+        assert!(!options.refresh);
+    }
+
+    fn command(
+        budget: Option<u32>,
+        pages: Option<u32>,
+        refresh: bool,
+        no_refresh: bool,
+    ) -> SyncCommand {
         SyncCommand {
             subreddits: Vec::new(),
             pages,
             loop_secs: None,
             budget,
-            refresh: true,
+            refresh,
+            no_refresh,
+        }
+    }
+
+    fn target(page_cap: Option<u32>, budget: Option<u32>, refresh: Option<bool>) -> WatchTarget {
+        WatchTarget {
+            subreddit: "rust".to_owned(),
+            page_cap,
+            budget,
+            refresh,
+        }
+    }
+
+    fn options(budget: usize, page_cap: usize, refresh: bool) -> EffectiveSyncOptions {
+        EffectiveSyncOptions {
+            budget,
+            page_cap,
+            refresh,
         }
     }
 }

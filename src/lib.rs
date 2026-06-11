@@ -70,9 +70,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             render::print_thread(&thread, cli.json, cli.no_color)?;
         }
         Commands::Watch(command) => match command {
-            WatchCommand::Add { subreddits } => {
-                store::watch_add(&paths, subreddits)?;
-                println!("added {} watch(es)", subreddits.len());
+            WatchCommand::Add(command) => {
+                store::watch_add(
+                    &paths,
+                    &command.subreddits,
+                    store::WatchOverrides::new(
+                        command.pages,
+                        command.budget,
+                        command.refresh_override(),
+                    ),
+                )?;
+                println!("added {} watch(es)", command.subreddits.len());
+            }
+            WatchCommand::Set(command) => {
+                store::watch_set(
+                    &paths,
+                    &command.subreddit,
+                    store::WatchOverrides::new(
+                        command.pages,
+                        command.budget,
+                        command.refresh_override(),
+                    ),
+                )?;
+                println!(
+                    "updated watch for r/{}",
+                    store::normalize_subreddit(&command.subreddit)
+                );
             }
             WatchCommand::Rm { subreddit } => {
                 store::watch_remove(&paths, subreddit)?;
@@ -92,7 +115,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
             let client = RedditClient::new(&config, &paths, &cli)?;
             loop {
-                let reports = sync::run_once(&paths, &client, command).await?;
+                let reports = sync::run_once(&paths, &client, &config, command).await?;
                 render::print_sync_reports(&reports, cli.json)?;
 
                 let Some(loop_secs) = command.loop_secs else {

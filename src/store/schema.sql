@@ -2,15 +2,16 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER PRIMARY KEY
 );
 
-INSERT OR IGNORE INTO schema_meta (version) VALUES (1);
-
 CREATE TABLE IF NOT EXISTS watches (
     subreddit TEXT PRIMARY KEY,
     active INTEGER NOT NULL DEFAULT 1,
     added_utc INTEGER NOT NULL,
     newest_post_fullname TEXT,
     newest_comment_fullname TEXT,
-    last_synced_utc INTEGER
+    last_synced_utc INTEGER,
+    page_cap INTEGER,
+    budget INTEGER,
+    refresh INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS posts (

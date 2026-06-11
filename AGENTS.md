@@ -13,6 +13,7 @@ The product boundary is important: the tool may search, browse, read, copy/open 
 - Sync issue: `PER-282` (`Implement watch sync into SQLite`)
 - Full-depth pull issue: `PER-283` (`Implement full-depth thread pull`)
 - Refresh issue: `PER-285` (`Implement sync refresh hydration`)
+- Watch override issue: `PER-286` (`Add persistent watch overrides and targeted capture workflow`)
 - HTTP cache issue: `PER-287` (`Implement HTTP cache TTL`)
 - GitHub target: `VishalJ99/reddit-cli`
 

@@ -37,6 +37,8 @@ pub struct Config {
     pub request_delay_ms: Option<u64>,
     pub cache_ttl_secs: Option<u64>,
     pub page_cap: Option<u32>,
+    pub sync_budget: Option<u32>,
+    pub sync_refresh: Option<bool>,
 }
 
 impl Config {
@@ -99,6 +101,12 @@ impl Config {
         }
         if self.page_cap.is_none() {
             self.page_cap = other.page_cap;
+        }
+        if self.sync_budget.is_none() {
+            self.sync_budget = other.sync_budget;
+        }
+        if self.sync_refresh.is_none() {
+            self.sync_refresh = other.sync_refresh;
         }
     }
 }
