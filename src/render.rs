@@ -38,7 +38,7 @@ pub fn print_thread(thread: &ThreadView, json: bool, no_color: bool) -> Result<(
         print_item(comment, no_color);
     }
 
-    if thread.more_stubs > 0 {
+    if thread.more_stubs > 0 && thread.notice.is_none() {
         eprintln!(
             "thread truncated: {} hidden comment stub(s) not expanded",
             thread.more_stubs
@@ -108,6 +108,8 @@ pub fn print_sync_reports(reports: &[SyncStreamReport], json: bool) -> Result<()
                     "updated_items": report.updated_items,
                     "http_requests": report.http_requests,
                     "status": report.status,
+                    "remaining_items": report.remaining_items,
+                    "notice": report.notice.as_deref(),
                 })
             })
             .collect::<Vec<_>>();
@@ -125,6 +127,9 @@ pub fn print_sync_reports(reports: &[SyncStreamReport], json: bool) -> Result<()
             report.http_requests,
             report.status
         );
+        if let Some(notice) = &report.notice {
+            println!("  {notice}");
+        }
     }
     Ok(())
 }

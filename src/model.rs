@@ -44,6 +44,45 @@ pub struct ListingPage {
     pub before: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoreStub {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub post_id: Option<String>,
+    pub children: Vec<String>,
+    pub count: usize,
+    pub depth: usize,
+}
+
+impl MoreStub {
+    pub fn unresolved_count(&self) -> usize {
+        self.children.len().max(self.count).max(1)
+    }
+
+    pub fn continue_parent_short_id(&self) -> Option<&str> {
+        if self.children.is_empty() {
+            self.parent_id
+                .as_deref()
+                .and_then(|parent| parent.strip_prefix("t1_"))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThreadCapture {
+    pub post: Option<RedditItem>,
+    pub comments: Vec<RedditItem>,
+    pub more_stubs: Vec<MoreStub>,
+}
+
+impl ThreadCapture {
+    pub fn more_stub_count(&self) -> usize {
+        self.more_stubs.iter().map(MoreStub::unresolved_count).sum()
+    }
+}
+
 impl RedditItem {
     pub fn canonical_permalink(&self) -> Option<String> {
         self.permalink.as_deref().map(canonical_permalink)
@@ -71,6 +110,8 @@ pub struct ThreadView {
     pub comments: Vec<RedditItem>,
     pub more_stubs: usize,
     pub degraded: bool,
+    pub truncated: bool,
+    pub http_requests: usize,
     pub notice: Option<String>,
 }
 

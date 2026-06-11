@@ -1,5 +1,6 @@
 use crate::model::{
-    ItemKind, ItemSource, ListingPage, RedditItem, ThreadView, canonical_permalink,
+    ItemKind, ItemSource, ListingPage, MoreStub, RedditItem, ThreadCapture, ThreadView,
+    canonical_permalink,
 };
 use anyhow::Result;
 use quick_xml::{Reader, events::Event};
@@ -29,23 +30,63 @@ pub fn parse_listing_page(value: &Value) -> ListingPage {
 }
 
 pub fn parse_thread(value: &Value, notice: Option<String>) -> ThreadView {
+    let capture = parse_thread_capture(value);
+    let more_stubs = capture.more_stub_count();
+    ThreadView {
+        post: capture.post,
+        comments: capture.comments,
+        more_stubs,
+        degraded: false,
+        truncated: false,
+        http_requests: 0,
+        notice,
+    }
+}
+
+pub fn parse_thread_capture(value: &Value) -> ThreadCapture {
     let post = value
         .as_array()
         .and_then(|array| array.first())
         .and_then(|listing| parse_listing(listing).into_iter().next());
+    let post_id = post.as_ref().map(|post| post.id.as_str());
 
     let mut comments = Vec::new();
-    let mut more_stubs = 0;
+    let mut more_stubs = Vec::new();
     if let Some(comment_listing) = value.as_array().and_then(|array| array.get(1)) {
-        parse_comment_listing(comment_listing, 0, &mut comments, &mut more_stubs);
+        parse_comment_listing(comment_listing, 0, post_id, &mut comments, &mut more_stubs);
     }
 
-    ThreadView {
+    ThreadCapture {
         post,
         comments,
         more_stubs,
-        degraded: false,
-        notice,
+    }
+}
+
+pub fn parse_morechildren(value: &Value, post_id: Option<&str>) -> ThreadCapture {
+    let things = value
+        .pointer("/json/data/things")
+        .and_then(Value::as_array)
+        .or_else(|| value.pointer("/data/things").and_then(Value::as_array));
+    let mut comments = Vec::new();
+    let mut more_stubs = Vec::new();
+
+    if let Some(things) = things {
+        for thing in things {
+            if thing.get("kind").and_then(Value::as_str) == Some("more") {
+                if let Some(stub) = parse_more_stub(thing, 0, post_id) {
+                    more_stubs.push(stub);
+                }
+            } else if let Some(item) = parse_thing(thing, 0, ItemSource::Json) {
+                comments.push(item);
+            }
+        }
+    }
+
+    ThreadCapture {
+        post: None,
+        comments,
+        more_stubs,
     }
 }
 
@@ -125,8 +166,9 @@ pub fn parse_atom_entries(xml: &str) -> Result<Vec<RedditItem>> {
 fn parse_comment_listing(
     value: &Value,
     depth: usize,
+    post_id: Option<&str>,
     comments: &mut Vec<RedditItem>,
-    more_stubs: &mut usize,
+    more_stubs: &mut Vec<MoreStub>,
 ) {
     let Some(children) = value.pointer("/data/children").and_then(Value::as_array) else {
         return;
@@ -134,10 +176,9 @@ fn parse_comment_listing(
 
     for thing in children {
         if thing.get("kind").and_then(Value::as_str) == Some("more") {
-            *more_stubs += thing
-                .pointer("/data/children")
-                .and_then(Value::as_array)
-                .map_or(1, |children| children.len().max(1));
+            if let Some(stub) = parse_more_stub(thing, depth, post_id) {
+                more_stubs.push(stub);
+            }
             continue;
         }
 
@@ -147,9 +188,49 @@ fn parse_comment_listing(
 
         let replies = thing.pointer("/data/replies");
         if let Some(reply_listing) = replies.filter(|value| value.is_object()) {
-            parse_comment_listing(reply_listing, depth + 1, comments, more_stubs);
+            parse_comment_listing(reply_listing, depth + 1, post_id, comments, more_stubs);
         }
     }
+}
+
+fn parse_more_stub(thing: &Value, depth: usize, post_id: Option<&str>) -> Option<MoreStub> {
+    let data = thing.get("data")?;
+    let id = string_field(data, "id")
+        .or_else(|| string_field(data, "name"))
+        .unwrap_or_default();
+    let children = data
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let count = int_field(data, "count")
+        .unwrap_or(children.len() as i64)
+        .max(0) as usize;
+    let link_post_id = string_field(data, "link_id")
+        .and_then(|value| value.strip_prefix("t3_").map(ToOwned::to_owned))
+        .or_else(|| post_id.map(ToOwned::to_owned));
+    let parent_id = string_field(data, "parent_id").or_else(|| {
+        if depth == 0 {
+            link_post_id.as_ref().map(|post_id| format!("t3_{post_id}"))
+        } else {
+            None
+        }
+    });
+
+    Some(MoreStub {
+        id,
+        parent_id,
+        post_id: link_post_id,
+        children,
+        count,
+        depth,
+    })
 }
 
 fn parse_thing(thing: &Value, depth: usize, source: ItemSource) -> Option<RedditItem> {
@@ -355,5 +436,40 @@ mod tests {
         assert_eq!(thread.comments.len(), 2);
         assert_eq!(thread.comments[1].depth, 1);
         assert_eq!(thread.more_stubs, 2);
+
+        let capture = parse_thread_capture(&value);
+        assert_eq!(capture.more_stubs.len(), 1);
+        assert_eq!(capture.more_stubs[0].children, vec!["x", "y"]);
+        assert_eq!(capture.more_stubs[0].parent_id.as_deref(), Some("t3_p"));
+        assert_eq!(capture.more_stubs[0].post_id.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn parses_morechildren_response() {
+        let value = json!({
+            "json": {"data": {"things": [
+                {"kind": "t1", "data": {
+                    "id": "c3",
+                    "name": "t1_c3",
+                    "parent_id": "t1_c1",
+                    "link_id": "t3_p",
+                    "body": "expanded"
+                }},
+                {"kind": "more", "data": {
+                    "id": "more",
+                    "parent_id": "t1_c3",
+                    "link_id": "t3_p",
+                    "children": ["c4"],
+                    "count": 1
+                }}
+            ]}}
+        });
+
+        let capture = parse_morechildren(&value, Some("p"));
+        assert_eq!(capture.comments.len(), 1);
+        assert_eq!(capture.comments[0].post_id.as_deref(), Some("p"));
+        assert_eq!(capture.comments[0].parent_id.as_deref(), Some("t1_c1"));
+        assert_eq!(capture.more_stubs.len(), 1);
+        assert_eq!(capture.more_stubs[0].parent_id.as_deref(), Some("t1_c3"));
     }
 }

@@ -20,6 +20,12 @@ pub fn write_last(paths: &Paths, items: &mut [RedditItem]) -> Result<()> {
 }
 
 pub fn resolve_target(paths: &Paths, target: &str) -> Result<String> {
+    let clean = target.trim();
+    let bare = clean.strip_prefix("t3_").unwrap_or(clean);
+    if is_probable_reddit_id(bare) {
+        return Ok(format!("https://www.reddit.com/comments/{bare}/"));
+    }
+
     if let Ok(index) = target.parse::<usize>() {
         let raw = fs::read_to_string(&paths.last_file)
             .with_context(|| format!("reading {}", paths.last_file.display()))?;
@@ -37,6 +43,11 @@ pub fn resolve_target(paths: &Paths, target: &str) -> Result<String> {
     let permalink = canonical_permalink(target);
     validate_reddit_permalink(&permalink)?;
     Ok(permalink)
+}
+
+pub fn resolve_post_target(paths: &Paths, target: &str) -> Result<String> {
+    let resolved = resolve_target(paths, target)?;
+    Ok(post_permalink_from_comment_permalink(&resolved).unwrap_or(resolved))
 }
 
 pub fn copy_permalink(target: &str) -> Result<()> {
@@ -62,6 +73,26 @@ fn validate_reddit_permalink(permalink: &str) -> Result<()> {
         Some("reddit.com" | "www.reddit.com" | "old.reddit.com") => Ok(()),
         _ => bail!("target must be a Reddit permalink"),
     }
+}
+
+fn is_probable_reddit_id(input: &str) -> bool {
+    (4..=12).contains(&input.len()) && input.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn post_permalink_from_comment_permalink(input: &str) -> Option<String> {
+    let parsed = url::Url::parse(input).ok()?;
+    validate_reddit_permalink(input).ok()?;
+    let segments = parsed
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())?;
+    let comments_index = segments.iter().position(|segment| *segment == "comments")?;
+    if segments.len() <= comments_index + 3 {
+        return None;
+    }
+
+    let keep = comments_index + 3;
+    let path = format!("/{}/", segments[..keep].join("/"));
+    Some(format!("https://www.reddit.com{path}"))
 }
 
 #[cfg(test)]
@@ -131,5 +162,53 @@ mod tests {
             .expect_err("external URLs should be rejected")
             .to_string();
         assert!(error.contains("target must be a Reddit permalink"));
+    }
+
+    #[test]
+    fn canonicalizes_bare_post_ids() {
+        let paths = Paths {
+            config_file: "/tmp/unused".into(),
+            data_dir: "/tmp/unused".into(),
+            cache_dir: "/tmp/unused".into(),
+            db_file: "/tmp/unused".into(),
+            last_file: "/tmp/unused".into(),
+        };
+
+        assert_eq!(
+            resolve_target(&paths, "1u2cx6q").unwrap(),
+            "https://www.reddit.com/comments/1u2cx6q/"
+        );
+        assert_eq!(
+            resolve_target(&paths, "t3_1u2cx6q").unwrap(),
+            "https://www.reddit.com/comments/1u2cx6q/"
+        );
+        assert_eq!(
+            resolve_target(&paths, "12345").unwrap(),
+            "https://www.reddit.com/comments/12345/"
+        );
+    }
+
+    #[test]
+    fn resolves_comment_permalink_to_post_for_pull_targets() {
+        let paths = Paths {
+            config_file: "/tmp/unused".into(),
+            data_dir: "/tmp/unused".into(),
+            cache_dir: "/tmp/unused".into(),
+            db_file: "/tmp/unused".into(),
+            last_file: "/tmp/unused".into(),
+        };
+
+        assert_eq!(
+            resolve_post_target(
+                &paths,
+                "https://www.reddit.com/r/adhd/comments/1u2cx6q/title/or33fa9/?utm=1"
+            )
+            .unwrap(),
+            "https://www.reddit.com/r/adhd/comments/1u2cx6q/title/"
+        );
+        assert_eq!(
+            resolve_post_target(&paths, "1u2cx6q").unwrap(),
+            "https://www.reddit.com/comments/1u2cx6q/"
+        );
     }
 }

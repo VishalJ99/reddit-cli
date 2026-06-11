@@ -5,6 +5,7 @@ pub mod error;
 pub mod model;
 pub mod parse;
 pub mod render;
+pub mod resolve;
 pub mod store;
 pub mod sync;
 pub mod transport;
@@ -12,7 +13,7 @@ pub mod transport;
 pub use cli::Cli;
 
 use anyhow::Context;
-use cli::{AuthCommand, Commands, DbCommand, WatchCommand};
+use cli::{AuthCommand, Commands, DbCommand, ThreadCommand, WatchCommand};
 use config::{Config, Paths};
 use std::time::Duration;
 use transport::RedditClient;
@@ -106,10 +107,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Pull(command) => {
-            let _ = command;
-            anyhow::bail!(
-                "pull is planned for M3 in DESIGN.md; deep DB capture is not implemented yet"
-            );
+            if cli.rss {
+                anyhow::bail!(
+                    "rdt --rss pull is planned but not implemented yet; full-depth pull needs JSON parent metadata"
+                );
+            }
+            let client = RedditClient::new(&config, &cli)?;
+            let target = actions::resolve_post_target(&paths, &command.target)?;
+            let thread_command = ThreadCommand {
+                target: command.target.clone(),
+                all: true,
+                depth: command.depth,
+                sort: command.sort,
+                max_requests: command.max_requests,
+            };
+            let thread = client.thread(&thread_command, &target).await?;
+            if thread.degraded {
+                anyhow::bail!(
+                    "rdt pull requires JSON parent metadata; RSS degraded thread output was not written"
+                );
+            }
+            let report = store::upsert_thread(&paths, &thread)?;
+            render::print_sync_reports(&[report], cli.json)?;
         }
         Commands::Digest(command) => {
             let rows =

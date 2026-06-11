@@ -11,6 +11,7 @@ The product boundary is important: the tool may search, browse, read, copy/open 
 - Linear project: `reddit-cli`
 - Bootstrap issue: `PER-280` (`Bootstrap public reddit-cli project from design`)
 - Sync issue: `PER-282` (`Implement watch sync into SQLite`)
+- Full-depth pull issue: `PER-283` (`Implement full-depth thread pull`)
 - GitHub target: `VishalJ99/reddit-cli`
 
 Commit bodies should put the ticket ID on the first body line.

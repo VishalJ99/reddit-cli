@@ -2,8 +2,9 @@ use crate::{
     cli::{BrowseCommand, SearchCommand, SubCommand, ThreadCommand, UserCommand},
     config::Config,
     error::RdtError,
-    model::{ListingPage, RedditItem, ThreadView},
+    model::{ListingPage, MoreStub, RedditItem, ThreadView},
     parse,
+    resolve::ThreadAccumulator,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -148,12 +149,6 @@ impl RedditClient {
     }
 
     pub async fn thread(&self, command: &ThreadCommand, target: &str) -> Result<ThreadView> {
-        if command.all {
-            anyhow::bail!(
-                "thread --all requires the M2 morechildren resolver and is not implemented in this bootstrap"
-            );
-        }
-
         let json_path = target_to_path(target, "json")?;
         let rss_path = target_to_path(target, "rss")?;
         if self.force_rss {
@@ -173,7 +168,15 @@ impl RedditClient {
             .collect::<Vec<_>>();
 
         match self.get_json(&json_path, &params).await {
-            Ok(value) => Ok(parse::parse_thread(&value, None)),
+            Ok(value) => {
+                if command.all {
+                    self.resolve_thread_all(command, value).await
+                } else {
+                    let mut thread = parse::parse_thread(&value, None);
+                    thread.http_requests = 1;
+                    Ok(thread)
+                }
+            }
             Err(error) if is_edge_block(&error) => self.fetch_thread_rss(&rss_path).await,
             Err(error) => Err(error),
         }
@@ -205,6 +208,94 @@ impl RedditClient {
             .or_else(|| value.get("name").and_then(Value::as_str))
             .context("auth check response did not include a username")?;
         Ok(format!("logged in as u/{name}"))
+    }
+
+    async fn resolve_thread_all(
+        &self,
+        command: &ThreadCommand,
+        initial: Value,
+    ) -> Result<ThreadView> {
+        let mut accumulator = ThreadAccumulator::new(parse::parse_thread_capture(&initial));
+        let mut http_requests = 1usize;
+        let max_requests = (command.max_requests as usize).max(1);
+        let mut truncated = false;
+
+        'resolve: while let Some(stub) = accumulator.pop_stub() {
+            if http_requests >= max_requests {
+                accumulator.keep_unresolved(stub);
+                truncated = true;
+                break;
+            }
+
+            if stub.children.is_empty() {
+                let Some(parent_short_id) = stub.continue_parent_short_id() else {
+                    accumulator.keep_unresolved(stub);
+                    continue;
+                };
+                let permalink = accumulator
+                    .post_permalink()
+                    .context("cannot fetch continue-thread subtree without post permalink")?;
+                let permalink_path = target_to_path(&permalink, "json")?;
+                let subtree_path = thread_subtree_path(&permalink_path, parent_short_id);
+                let value = self.get_thread_json_path(&subtree_path, command).await?;
+                http_requests += 1;
+                accumulator.add_capture(parse::parse_thread_capture(&value));
+                continue;
+            }
+
+            let link_id = accumulator
+                .post_fullname()
+                .or_else(|| stub.post_id.as_ref().map(|post_id| format!("t3_{post_id}")))
+                .context("cannot expand morechildren without post id")?;
+            for start in (0..stub.children.len()).step_by(100) {
+                if http_requests >= max_requests {
+                    accumulator.keep_unresolved(stub_with_children(&stub, start));
+                    truncated = true;
+                    break 'resolve;
+                }
+
+                let end = (start + 100).min(stub.children.len());
+                let value = self
+                    .morechildren_json(&link_id, &stub.children[start..end], command)
+                    .await?;
+                http_requests += 1;
+                let post_id = accumulator.post_id().map(ToOwned::to_owned);
+                accumulator.add_capture(parse::parse_morechildren(&value, post_id.as_deref()));
+            }
+        }
+
+        Ok(accumulator.into_view(http_requests, truncated))
+    }
+
+    async fn get_thread_json_path(&self, path: &str, command: &ThreadCommand) -> Result<Value> {
+        let mut owned = vec![
+            ("sort".to_owned(), command.sort.as_reddit().to_owned()),
+            ("limit".to_owned(), "500".to_owned()),
+        ];
+        if let Some(depth) = command.depth {
+            owned.push(("depth".to_owned(), depth.to_string()));
+        }
+        let params = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        self.get_json(path, &params).await
+    }
+
+    async fn morechildren_json(
+        &self,
+        link_id: &str,
+        children: &[String],
+        command: &ThreadCommand,
+    ) -> Result<Value> {
+        let children = children.join(",");
+        let params = [
+            ("api_type", "json"),
+            ("link_id", link_id),
+            ("children", children.as_str()),
+            ("sort", command.sort.as_reddit()),
+        ];
+        self.get_json("/api/morechildren.json", &params).await
     }
 
     async fn fetch_listing_with_fallback(
@@ -262,6 +353,8 @@ impl RedditClient {
             comments,
             more_stubs: 0,
             degraded: true,
+            truncated: false,
+            http_requests: 1,
             notice: Some(
                 "RSS degraded mode: comments are flat and scores/tree metadata are unavailable"
                     .to_owned(),
@@ -464,6 +557,20 @@ fn listing_segment(input: &str) -> Result<&str> {
     }
 }
 
+fn thread_subtree_path(base_json_path: &str, comment_id: &str) -> String {
+    let base = base_json_path
+        .trim_end_matches(".json")
+        .trim_end_matches('/');
+    format!("{base}/{comment_id}.json")
+}
+
+fn stub_with_children(stub: &MoreStub, start: usize) -> MoreStub {
+    let mut out = stub.clone();
+    out.children = stub.children[start..].to_vec();
+    out.count = out.children.len().max(1);
+    out
+}
+
 fn target_to_path(target: &str, ext: &str) -> Result<String> {
     let clean = target.trim();
     let clean = clean.strip_prefix("t3_").unwrap_or(clean);
@@ -548,6 +655,18 @@ mod tests {
             )
             .unwrap(),
             "/r/rust/comments/abc/title.json"
+        );
+    }
+
+    #[test]
+    fn builds_continue_thread_subtree_paths() {
+        assert_eq!(
+            thread_subtree_path("/r/rust/comments/abc/title.json", "def"),
+            "/r/rust/comments/abc/title/def.json"
+        );
+        assert_eq!(
+            thread_subtree_path("/comments/abc.json", "def"),
+            "/comments/abc/def.json"
         );
     }
 

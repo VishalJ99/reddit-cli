@@ -1,6 +1,6 @@
 use crate::{
     config::Paths,
-    model::{DbRow, ItemKind, RedditItem},
+    model::{DbRow, ItemKind, RedditItem, ThreadView},
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
@@ -16,6 +16,7 @@ const SCHEMA: &str = include_str!("store/schema.sql");
 pub enum StreamKind {
     Posts,
     Comments,
+    Backfill,
 }
 
 impl StreamKind {
@@ -23,6 +24,7 @@ impl StreamKind {
         match self {
             Self::Posts => "posts",
             Self::Comments => "comments",
+            Self::Backfill => "backfill",
         }
     }
 }
@@ -35,6 +37,8 @@ pub struct SyncStreamReport {
     pub updated_items: usize,
     pub http_requests: usize,
     pub status: String,
+    pub remaining_items: Option<usize>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -160,7 +164,11 @@ pub fn search(paths: &Paths, text: &str) -> Result<Vec<DbRow>> {
 
 pub fn known_count(paths: &Paths, kind: StreamKind, items: &[RedditItem]) -> Result<usize> {
     let conn = open(paths)?;
-    let table = kind.as_str();
+    let table = match kind {
+        StreamKind::Posts => "posts",
+        StreamKind::Comments => "comments",
+        StreamKind::Backfill => anyhow::bail!("backfill is not a concrete item table"),
+    };
     let sql = format!("SELECT 1 FROM {table} WHERE id = ?1 LIMIT 1");
     let mut stmt = conn.prepare(&sql)?;
     let mut count = 0;
@@ -198,11 +206,60 @@ pub fn upsert_items(
                     upsert_comment(&tx, subreddit, item, &mut stats)?;
                 }
             }
+            StreamKind::Backfill => anyhow::bail!("backfill upsert requires a thread view"),
         }
     }
 
     tx.commit()?;
     Ok(stats)
+}
+
+pub fn upsert_thread(paths: &Paths, thread: &ThreadView) -> Result<SyncStreamReport> {
+    let started = now_utc();
+    let mut conn = open(paths)?;
+    let tx = conn.transaction()?;
+    let mut stats = UpsertStats::default();
+    let subreddit = thread
+        .post
+        .as_ref()
+        .and_then(|post| post.subreddit.as_deref())
+        .or_else(|| {
+            thread
+                .comments
+                .iter()
+                .find_map(|comment| comment.subreddit.as_deref())
+        })
+        .map(clean_subreddit)
+        .context("thread did not include a subreddit")?;
+
+    if let Some(post) = &thread.post {
+        upsert_post(&tx, &subreddit, post, &mut stats)?;
+    }
+    for comment in &thread.comments {
+        if comment.kind == ItemKind::Comment {
+            upsert_comment(&tx, &subreddit, comment, &mut stats)?;
+        }
+    }
+
+    tx.commit()?;
+
+    let report = SyncStreamReport {
+        subreddit,
+        kind: StreamKind::Backfill,
+        new_items: stats.new_items,
+        updated_items: stats.updated_items,
+        http_requests: thread.http_requests,
+        status: if thread.truncated || thread.more_stubs > 0 {
+            "gap"
+        } else {
+            "ok"
+        }
+        .to_owned(),
+        remaining_items: (thread.more_stubs > 0).then_some(thread.more_stubs),
+        notice: thread.notice.clone(),
+    };
+    append_sync_log(paths, &report, started, now_utc(), None)?;
+    Ok(report)
 }
 
 pub fn update_watch_watermark(
@@ -235,6 +292,7 @@ pub fn update_watch_watermark(
              WHERE subreddit = ?1",
             params![subreddit, newest_fullname, now],
         )?,
+        StreamKind::Backfill => anyhow::bail!("backfill does not use watch watermarks"),
     };
     Ok(())
 }
@@ -746,6 +804,73 @@ mod tests {
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 
+    #[test]
+    fn upserts_thread_and_logs_backfill() {
+        let paths = temp_paths();
+        let thread = ThreadView {
+            post: Some(test_post("abc")),
+            comments: vec![test_comment("def", "t3_abc")],
+            more_stubs: 0,
+            degraded: false,
+            truncated: false,
+            http_requests: 4,
+            notice: None,
+        };
+
+        let report = upsert_thread(&paths, &thread).unwrap();
+        assert_eq!(report.kind, StreamKind::Backfill);
+        assert_eq!(report.new_items, 2);
+        assert_eq!(report.http_requests, 4);
+        assert_eq!(report.status, "ok");
+        assert_eq!(
+            query(&paths, "SELECT COUNT(*) AS n FROM posts").unwrap()[0].get("n"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            query(&paths, "SELECT COUNT(*) AS n FROM comments").unwrap()[0].get("n"),
+            Some(&json!(1))
+        );
+        let rows = query(
+            &paths,
+            "SELECT kind, http_requests, status FROM sync_log WHERE subreddit = 'rust'",
+        )
+        .unwrap();
+        assert_eq!(rows[0].get("kind"), Some(&json!("backfill")));
+        assert_eq!(rows[0].get("http_requests"), Some(&json!(4)));
+        assert_eq!(rows[0].get("status"), Some(&json!("ok")));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn incomplete_thread_backfill_logs_gap() {
+        let paths = temp_paths();
+        let thread = ThreadView {
+            post: Some(test_post("abc")),
+            comments: vec![test_comment("def", "t3_abc")],
+            more_stubs: 3,
+            degraded: false,
+            truncated: false,
+            http_requests: 4,
+            notice: Some("thread incomplete: 3 hidden comment(s) could not be resolved".to_owned()),
+        };
+
+        let report = upsert_thread(&paths, &thread).unwrap();
+        assert_eq!(report.status, "gap");
+        assert_eq!(report.remaining_items, Some(3));
+        assert_eq!(
+            report.notice.as_deref(),
+            Some("thread incomplete: 3 hidden comment(s) could not be resolved")
+        );
+        let rows = query(
+            &paths,
+            "SELECT kind, status FROM sync_log WHERE subreddit = 'rust'",
+        )
+        .unwrap();
+        assert_eq!(rows[0].get("kind"), Some(&json!("backfill")));
+        assert_eq!(rows[0].get("status"), Some(&json!("gap")));
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
     fn temp_paths() -> Paths {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -760,6 +885,60 @@ mod tests {
             cache_dir: root.join("cache"),
             db_file: root.join("data/rdt.db"),
             last_file: root.join("cache/last.json"),
+        }
+    }
+
+    fn test_post(id: &str) -> RedditItem {
+        RedditItem {
+            index: None,
+            kind: ItemKind::Post,
+            id: id.to_owned(),
+            fullname: format!("t3_{id}"),
+            parent_id: None,
+            post_id: Some(id.to_owned()),
+            title: Some("Post".to_owned()),
+            author: Some("alice".to_owned()),
+            subreddit: Some("rust".to_owned()),
+            body: Some("body".to_owned()),
+            flair: None,
+            is_self: Some(true),
+            over_18: Some(false),
+            score: Some(1),
+            upvote_ratio: Some(0.9),
+            num_comments: Some(1),
+            created_utc: Some(10.0),
+            edited_utc: None,
+            permalink: Some(format!("/r/rust/comments/{id}/post/")),
+            url: None,
+            depth: 0,
+            source: ItemSource::Json,
+        }
+    }
+
+    fn test_comment(id: &str, parent_id: &str) -> RedditItem {
+        RedditItem {
+            index: None,
+            kind: ItemKind::Comment,
+            id: id.to_owned(),
+            fullname: format!("t1_{id}"),
+            parent_id: Some(parent_id.to_owned()),
+            post_id: Some("abc".to_owned()),
+            title: None,
+            author: Some("bob".to_owned()),
+            subreddit: Some("rust".to_owned()),
+            body: Some("reply".to_owned()),
+            flair: None,
+            is_self: None,
+            over_18: None,
+            score: Some(2),
+            upvote_ratio: None,
+            num_comments: None,
+            created_utc: Some(11.0),
+            edited_utc: None,
+            permalink: Some(format!("/r/rust/comments/abc/post/{id}/")),
+            url: None,
+            depth: 0,
+            source: ItemSource::Json,
         }
     }
 }

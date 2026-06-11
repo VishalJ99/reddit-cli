@@ -146,6 +146,12 @@ pub struct SyncCommand {
 #[derive(Debug, Args)]
 pub struct PullCommand {
     pub target: String,
+    #[arg(long)]
+    pub depth: Option<u32>,
+    #[arg(long, value_enum, default_value_t = ThreadSort::Best)]
+    pub sort: ThreadSort,
+    #[arg(long, default_value_t = 30)]
+    pub max_requests: u32,
 }
 
 #[derive(Debug, Args)]

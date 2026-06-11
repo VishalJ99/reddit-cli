@@ -54,6 +54,7 @@ async fn sync_stream(
             Ok(report)
         }
         Err(error) => {
+            let message = error.to_string();
             let report = SyncStreamReport {
                 subreddit: store::normalize_subreddit(subreddit),
                 kind,
@@ -61,8 +62,9 @@ async fn sync_stream(
                 updated_items: progress.updated_items,
                 http_requests: progress.http_requests,
                 status: "error".to_owned(),
+                remaining_items: None,
+                notice: Some(message.clone()),
             };
-            let message = error.to_string();
             if let Err(log_error) =
                 store::append_sync_log(paths, &report, started, store::utc_now(), Some(&message))
             {
@@ -84,6 +86,7 @@ async fn sync_stream_inner(
     let listing = match kind {
         StreamKind::Posts => "new",
         StreamKind::Comments => "comments",
+        StreamKind::Backfill => unreachable!("backfill is not a watch stream"),
     };
     let mut remaining = command.budget.max(1) as usize;
     let page_cap = command
@@ -139,6 +142,8 @@ async fn sync_stream_inner(
         updated_items: progress.updated_items,
         http_requests: progress.http_requests,
         status,
+        remaining_items: None,
+        notice: None,
     };
     Ok(report)
 }
@@ -149,6 +154,7 @@ fn sync_relevant_len(kind: StreamKind, page: &ListingPage) -> usize {
         .filter(|item| match kind {
             StreamKind::Posts => item.kind == crate::model::ItemKind::Post,
             StreamKind::Comments => item.kind == crate::model::ItemKind::Comment,
+            StreamKind::Backfill => false,
         })
         .count()
 }
