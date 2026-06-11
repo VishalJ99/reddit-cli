@@ -5,6 +5,7 @@ edition = "2024"
 description = "A strictly read-only Reddit CLI for search, browsing, thread reading, and local capture."
 readme = "README.md"
 repository = "https://github.com/VishalJ99/reddit-cli"
+license = "MIT"
 
 [[bin]]
 name = "rdt"

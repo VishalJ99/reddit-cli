@@ -128,4 +128,4 @@ This project intentionally has no Reddit write commands. Do not add automated po
 
 ## License
 
-No open-source license has been selected yet. The repository can be public before a license is chosen, but reuse rights should be decided explicitly.
+MIT. See [LICENSE](LICENSE).
