@@ -170,24 +170,57 @@ pub struct SyncCommand {
     #[arg(
         long = "sub",
         value_delimiter = ',',
+        conflicts_with = "backfill",
         help = "Sync explicit subreddit(s) instead of only active watches"
     )]
     pub subreddits: Vec<String>,
     #[arg(long, help = "Override the page cap per stream")]
     pub pages: Option<u32>,
-    #[arg(long = "loop", help = "Repeat sync every SECS seconds")]
+    #[arg(
+        long = "loop",
+        conflicts_with = "backfill",
+        help = "Repeat sync every SECS seconds"
+    )]
     pub loop_secs: Option<u64>,
     #[arg(long, help = "Override the item budget per stream")]
     pub budget: Option<u32>,
-    #[arg(long, conflicts_with = "no_refresh", action = clap::ArgAction::SetTrue, help = "Hydrate recent stored posts with /api/info after stream sync")]
+    #[arg(long, conflicts_with_all = ["no_refresh", "backfill"], action = clap::ArgAction::SetTrue, help = "Hydrate recent stored posts with /api/info after stream sync")]
     pub refresh: bool,
-    #[arg(long = "no-refresh", conflicts_with = "refresh", action = clap::ArgAction::SetTrue, help = "Disable refresh even if a watch or config enables it")]
+    #[arg(long = "no-refresh", conflicts_with_all = ["refresh", "backfill"], action = clap::ArgAction::SetTrue, help = "Disable refresh even if a watch or config enables it")]
     pub no_refresh: bool,
+    #[arg(
+        long,
+        value_name = "SUB",
+        help = "Deep-capture recent posts from a subreddit into SQLite"
+    )]
+    pub backfill: Option<String>,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+        requires = "backfill",
+        help = "Backfill posts newer than DAYS ago"
+    )]
+    pub days: Option<u32>,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+        requires = "backfill",
+        help = "Thread request cap per backfilled post"
+    )]
+    pub max_requests: Option<u32>,
 }
 
 impl SyncCommand {
     pub fn refresh_override(&self) -> Option<bool> {
         refresh_flag_override(self.refresh, self.no_refresh)
+    }
+
+    pub fn backfill_days(&self) -> u32 {
+        self.days.unwrap_or(2)
+    }
+
+    pub fn backfill_max_requests(&self) -> u32 {
+        self.max_requests.unwrap_or(10)
     }
 }
 
@@ -274,6 +307,52 @@ mod tests {
                 assert_eq!(command.since.as_deref(), Some("24h"));
             }
             _ => panic!("expected digest command"),
+        }
+    }
+
+    #[test]
+    fn sync_accepts_backfill_mode_and_rejects_sub_mix() {
+        let cli = Cli::try_parse_from([
+            "rdt",
+            "sync",
+            "--backfill",
+            "adhd",
+            "--days",
+            "1",
+            "--budget",
+            "2",
+            "--pages",
+            "1",
+            "--max-requests",
+            "3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sync(command) => {
+                assert_eq!(command.backfill.as_deref(), Some("adhd"));
+                assert_eq!(command.backfill_days(), 1);
+                assert_eq!(command.budget, Some(2));
+                assert_eq!(command.pages, Some(1));
+                assert_eq!(command.backfill_max_requests(), 3);
+            }
+            _ => panic!("expected sync command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["rdt", "sync", "--sub", "rust", "--backfill", "adhd"]).is_err()
+        );
+    }
+
+    #[test]
+    fn sync_backfill_defaults_are_only_for_backfill_mode() {
+        let cli = Cli::try_parse_from(["rdt", "sync", "--sub", "rust"]).unwrap();
+        match cli.command {
+            Commands::Sync(command) => {
+                assert_eq!(command.backfill, None);
+                assert_eq!(command.days, None);
+                assert_eq!(command.max_requests, None);
+            }
+            _ => panic!("expected sync command"),
         }
     }
 }

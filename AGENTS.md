@@ -16,6 +16,7 @@ The product boundary is important: the tool may search, browse, read, copy/open 
 - Watch override issue: `PER-286` (`Add persistent watch overrides and targeted capture workflow`)
 - HTTP cache issue: `PER-287` (`Implement HTTP cache TTL`)
 - Digest issue: `PER-289` (`Implement LLM-ready local digest`)
+- Backfill issue: `PER-291` (`Implement recent post sync backfill`)
 - GitHub target: `VishalJ99/reddit-cli`
 
 Commit bodies should put the ticket ID on the first body line.

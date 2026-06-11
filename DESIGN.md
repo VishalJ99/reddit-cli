@@ -122,7 +122,8 @@ READING
 
 WATCHING → SQLITE
   rdt watch add SUB…   |  rdt watch rm SUB  |  rdt watch ls
-  rdt sync [--loop SECS] [--budget N] [--refresh]
+  rdt sync [--loop SECS] [--budget N] [--pages N] [--refresh]
+  rdt sync --backfill SUB [--days D] [--budget N] [--pages N] [--max-requests M]
   rdt pull URL|ID|N                      # full comment tree of one post → DB (backfill/deep capture)
   rdt digest [--since 24h] [--sub S] [--md|--json]   # LLM-ready export of new activity
   rdt db path | rdt db query "SQL" [--json] | rdt db search QUERY   # FTS5 over everything captured

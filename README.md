@@ -94,6 +94,7 @@ rdt watch ls
 rdt sync --sub rust --budget 300
 rdt sync --sub rust --refresh --budget 100
 rdt sync --sub rust --budget 500 --pages 5
+rdt sync --backfill rust --days 2 --budget 3 --pages 2 --max-requests 10
 rdt pull 1 --max-requests 10
 rdt digest --since 24h --sub rust
 rdt digest --since 24h --sub rust --json
@@ -104,6 +105,8 @@ rdt saved
 `rdt sync` uses active watches by default. `--sub` targets an explicit subreddit without a separate watch command. The subreddit comment stream is flat and newest-first but includes comments from any depth, so watch sync has no tree-depth cutoff; it is bounded by page and item caps instead. For a deeper catch-up run, raise both the hard item cap (`--budget`) and the page cap (`--pages`). CLI flags override watch settings for that run; otherwise per-watch settings override global config/defaults. `--refresh` also hydrates recent stored posts for each synced subreddit; it uses the same caps and logs `kind = refresh`.
 
 The intended capture pattern is broad and cheap first, then selective depth. A watch polls `/new` and `/comments`, which is enough for the mostly-flat activity across a subreddit. For an interesting post, use `rdt pull N` from the last listing or `rdt pull URL --max-requests 50` for an arbitrary thread URL. `rdt pull` expands hidden comment stubs up to `--max-requests`, writes the post/comments to SQLite, and logs `kind = backfill`; if the cap is reached, the report status is `gap`. Arbitrary listing URL watches are not part of the current schema; ongoing watches stay subreddit-scoped.
+
+`rdt sync --backfill SUB --days D` is the bounded catch-up path for recent posts from a subreddit. It scans `/new` up to `--pages` at Reddit's 100-item listing limit, deep-pulls up to `--budget` posts newer than the day cutoff, and gives each selected thread `--max-requests` resolver requests. Defaults are `--days 2`, `--budget 3`, `--pages 1`, and `--max-requests 10`; backfill does not inherit watch or global flat-sync budgets. The command emits one aggregate `kind = backfill` report; `gap` means a page, post, or thread expansion cap stopped a complete catch-up.
 
 Ordinary read commands use a disk-backed HTTP cache with a 5 minute default TTL. Use `--fresh` to bypass cache reads and refresh the stored response. Watch sync, refresh hydration, auth checks, and pull/backfill capture bypass this cache by design. Cache keys separate anonymous reads from each configured cookie identity without writing cookies or raw URLs into filenames. Set `cache_ttl_secs` in `config.toml` to override the TTL.
 

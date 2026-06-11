@@ -482,6 +482,28 @@ pub fn upsert_items(
 
 pub fn upsert_thread(paths: &Paths, thread: &ThreadView) -> Result<SyncStreamReport> {
     let started = now_utc();
+    let (subreddit, stats) = upsert_thread_items(paths, thread)?;
+
+    let report = SyncStreamReport {
+        subreddit,
+        kind: StreamKind::Backfill,
+        new_items: stats.new_items,
+        updated_items: stats.updated_items,
+        http_requests: thread.http_requests,
+        status: if thread.truncated || thread.more_stubs > 0 {
+            "gap"
+        } else {
+            "ok"
+        }
+        .to_owned(),
+        remaining_items: (thread.more_stubs > 0).then_some(thread.more_stubs),
+        notice: thread.notice.clone(),
+    };
+    append_sync_log(paths, &report, started, now_utc(), None)?;
+    Ok(report)
+}
+
+pub fn upsert_thread_items(paths: &Paths, thread: &ThreadView) -> Result<(String, UpsertStats)> {
     let mut conn = open(paths)?;
     let tx = conn.transaction()?;
     let mut stats = UpsertStats::default();
@@ -508,24 +530,7 @@ pub fn upsert_thread(paths: &Paths, thread: &ThreadView) -> Result<SyncStreamRep
     }
 
     tx.commit()?;
-
-    let report = SyncStreamReport {
-        subreddit,
-        kind: StreamKind::Backfill,
-        new_items: stats.new_items,
-        updated_items: stats.updated_items,
-        http_requests: thread.http_requests,
-        status: if thread.truncated || thread.more_stubs > 0 {
-            "gap"
-        } else {
-            "ok"
-        }
-        .to_owned(),
-        remaining_items: (thread.more_stubs > 0).then_some(thread.more_stubs),
-        notice: thread.notice.clone(),
-    };
-    append_sync_log(paths, &report, started, now_utc(), None)?;
-    Ok(report)
+    Ok((subreddit, stats))
 }
 
 pub fn update_watch_watermark(
