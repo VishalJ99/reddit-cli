@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS posts (
     edited_utc INTEGER,
     first_seen_utc INTEGER,
     last_updated_utc INTEGER,
+    source TEXT NOT NULL DEFAULT 'json',
     removed INTEGER DEFAULT 0,
     raw TEXT
 );
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS comments (
     permalink TEXT,
     first_seen_utc INTEGER,
     last_updated_utc INTEGER,
+    source TEXT NOT NULL DEFAULT 'json',
     removed INTEGER DEFAULT 0,
     raw TEXT
 );

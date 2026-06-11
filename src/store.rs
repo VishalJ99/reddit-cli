@@ -1,6 +1,8 @@
 use crate::{
     config::Paths,
-    model::{DbRow, Digest, DigestComment, DigestPost, ItemKind, RedditItem, ThreadView},
+    model::{
+        DbRow, Digest, DigestComment, DigestPost, ItemKind, ItemSource, RedditItem, ThreadView,
+    },
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, types::ValueRef};
@@ -11,7 +13,7 @@ use std::{
 };
 
 const SCHEMA: &str = include_str!("store/schema.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const DIGEST_POST_LIMIT: i64 = 50;
 const DIGEST_COMMENTS_PER_POST_LIMIT: i64 = 10;
 const DIGEST_ORPHAN_COMMENT_LIMIT: i64 = 25;
@@ -638,6 +640,7 @@ fn open(paths: &Paths) -> Result<Connection> {
         .with_context(|| format!("opening {}", paths.db_file.display()))?;
     conn.execute_batch(SCHEMA)?;
     ensure_watch_override_columns(&conn)?;
+    ensure_item_source_columns(&conn)?;
     set_schema_version(&conn)?;
     conn.execute_batch(
         "UPDATE watches SET subreddit = lower(subreddit) WHERE subreddit != lower(subreddit);
@@ -664,7 +667,7 @@ fn set_schema_version(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_watch_override_columns(conn: &Connection) -> Result<()> {
-    let columns = watch_columns(conn)?;
+    let columns = table_columns(conn, "watches")?;
     for (name, definition) in [
         ("page_cap", "page_cap INTEGER"),
         ("budget", "budget INTEGER"),
@@ -677,8 +680,21 @@ fn ensure_watch_override_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn watch_columns(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("PRAGMA table_info(watches)")?;
+fn ensure_item_source_columns(conn: &Connection) -> Result<()> {
+    for table in ["posts", "comments"] {
+        let columns = table_columns(conn, table)?;
+        if !columns.iter().any(|column| column == "source") {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'json'"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -705,37 +721,77 @@ fn upsert_post(
         "INSERT INTO posts
          (id, subreddit, title, author, selftext, url, permalink, flair, is_self, over_18,
           score, upvote_ratio, num_comments, created_utc, edited_utc, first_seen_utc,
-          last_updated_utc, removed, raw)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL)
+          last_updated_utc, source, removed, raw)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, NULL)
          ON CONFLICT(id) DO UPDATE SET
           subreddit = excluded.subreddit,
           title = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss'
+            THEN posts.title
             WHEN excluded.removed = 1 AND posts.title IS NOT NULL AND posts.title NOT IN ('[deleted]', '[removed]')
             THEN posts.title
             ELSE excluded.title
           END,
           author = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss'
+            THEN posts.author
             WHEN excluded.removed = 1 AND posts.author IS NOT NULL AND posts.author != '[deleted]'
             THEN posts.author
             ELSE excluded.author
           END,
           selftext = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss'
+            THEN posts.selftext
             WHEN excluded.removed = 1 AND posts.selftext IS NOT NULL AND posts.selftext NOT IN ('[deleted]', '[removed]')
             THEN posts.selftext
             ELSE excluded.selftext
           END,
-          url = excluded.url,
+          url = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.url
+            ELSE excluded.url
+          END,
           permalink = excluded.permalink,
-          flair = excluded.flair,
-          is_self = excluded.is_self,
-          over_18 = excluded.over_18,
-          score = excluded.score,
-          upvote_ratio = excluded.upvote_ratio,
-          num_comments = excluded.num_comments,
-          created_utc = excluded.created_utc,
-          edited_utc = excluded.edited_utc,
+          flair = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.flair
+            ELSE excluded.flair
+          END,
+          is_self = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.is_self
+            ELSE excluded.is_self
+          END,
+          over_18 = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.over_18
+            ELSE excluded.over_18
+          END,
+          score = CASE
+            WHEN excluded.source = 'rss' AND excluded.score IS NULL THEN posts.score
+            ELSE excluded.score
+          END,
+          upvote_ratio = CASE
+            WHEN excluded.source = 'rss' AND excluded.upvote_ratio IS NULL THEN posts.upvote_ratio
+            ELSE excluded.upvote_ratio
+          END,
+          num_comments = CASE
+            WHEN excluded.source = 'rss' AND excluded.num_comments IS NULL THEN posts.num_comments
+            ELSE excluded.num_comments
+          END,
+          created_utc = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.created_utc
+            ELSE excluded.created_utc
+          END,
+          edited_utc = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.edited_utc
+            ELSE excluded.edited_utc
+          END,
           last_updated_utc = excluded.last_updated_utc,
-          removed = excluded.removed",
+          source = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.source
+            ELSE excluded.source
+          END,
+          removed = CASE
+            WHEN posts.source IN ('json', 'local') AND excluded.source = 'rss' THEN posts.removed
+            ELSE excluded.removed
+          END",
         params![
             item.id,
             subreddit,
@@ -754,6 +810,7 @@ fn upsert_post(
             opt_epoch(item.edited_utc),
             now,
             now,
+            item_source_name(item.source),
             removed_flag(item.body.as_deref()),
         ],
     )?;
@@ -774,28 +831,54 @@ fn upsert_comment(
     tx.execute(
         "INSERT INTO comments
          (id, post_id, parent_id, subreddit, author, body, score, created_utc, edited_utc,
-          permalink, first_seen_utc, last_updated_utc, removed, raw)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
+          permalink, first_seen_utc, last_updated_utc, source, removed, raw)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)
          ON CONFLICT(id) DO UPDATE SET
-          post_id = excluded.post_id,
-          parent_id = excluded.parent_id,
+          post_id = CASE
+            WHEN excluded.source = 'rss' AND excluded.post_id IS NULL THEN comments.post_id
+            ELSE excluded.post_id
+          END,
+          parent_id = CASE
+            WHEN excluded.source = 'rss' AND excluded.parent_id IS NULL THEN comments.parent_id
+            ELSE excluded.parent_id
+          END,
           subreddit = excluded.subreddit,
           author = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss'
+            THEN comments.author
             WHEN excluded.removed = 1 AND comments.author IS NOT NULL AND comments.author != '[deleted]'
             THEN comments.author
             ELSE excluded.author
           END,
           body = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss'
+            THEN comments.body
             WHEN excluded.removed = 1 AND comments.body IS NOT NULL AND comments.body NOT IN ('[deleted]', '[removed]')
             THEN comments.body
             ELSE excluded.body
           END,
-          score = excluded.score,
-          created_utc = excluded.created_utc,
-          edited_utc = excluded.edited_utc,
+          score = CASE
+            WHEN excluded.source = 'rss' AND excluded.score IS NULL THEN comments.score
+            ELSE excluded.score
+          END,
+          created_utc = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss' THEN comments.created_utc
+            ELSE excluded.created_utc
+          END,
+          edited_utc = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss' THEN comments.edited_utc
+            ELSE excluded.edited_utc
+          END,
           permalink = excluded.permalink,
           last_updated_utc = excluded.last_updated_utc,
-          removed = excluded.removed",
+          source = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss' THEN comments.source
+            ELSE excluded.source
+          END,
+          removed = CASE
+            WHEN comments.source IN ('json', 'local') AND excluded.source = 'rss' THEN comments.removed
+            ELSE excluded.removed
+          END",
         params![
             item.id,
             item.post_id,
@@ -809,6 +892,7 @@ fn upsert_comment(
             item.canonical_permalink(),
             now,
             now,
+            item_source_name(item.source),
             removed_flag(item.body.as_deref()),
         ],
     )?;
@@ -873,6 +957,14 @@ fn removed_flag(body: Option<&str>) -> i64 {
     match body {
         Some("[deleted]" | "[removed]") => 1,
         _ => 0,
+    }
+}
+
+fn item_source_name(source: ItemSource) -> &'static str {
+    match source {
+        ItemSource::Json => "json",
+        ItemSource::Rss => "rss",
+        ItemSource::Local => "local",
     }
 }
 
@@ -1003,7 +1095,7 @@ mod tests {
         assert_eq!(rows[0].get("subreddit").unwrap(), "rust");
         assert_eq!(
             query(&paths, "SELECT version FROM schema_meta").unwrap()[0].get("version"),
-            Some(&json!(2))
+            Some(&json!(3))
         );
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
@@ -1133,7 +1225,76 @@ mod tests {
         assert_eq!(rows[0].get("refresh"), Some(&json!(1)));
         assert_eq!(
             query(&paths, "SELECT version FROM schema_meta").unwrap()[0].get("version"),
-            Some(&json!(2))
+            Some(&json!(3))
+        );
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn migrates_old_item_tables_for_source_provenance() {
+        let paths = temp_paths();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let conn = Connection::open(&paths.db_file).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE posts (
+                id TEXT PRIMARY KEY,
+                subreddit TEXT,
+                title TEXT,
+                author TEXT,
+                selftext TEXT,
+                url TEXT,
+                permalink TEXT,
+                flair TEXT,
+                is_self INTEGER,
+                over_18 INTEGER,
+                score INTEGER,
+                upvote_ratio REAL,
+                num_comments INTEGER,
+                created_utc INTEGER,
+                edited_utc INTEGER,
+                first_seen_utc INTEGER,
+                last_updated_utc INTEGER,
+                removed INTEGER DEFAULT 0,
+                raw TEXT
+            );
+            CREATE TABLE comments (
+                id TEXT PRIMARY KEY,
+                post_id TEXT,
+                parent_id TEXT,
+                subreddit TEXT,
+                author TEXT,
+                body TEXT,
+                score INTEGER,
+                created_utc INTEGER,
+                edited_utc INTEGER,
+                permalink TEXT,
+                first_seen_utc INTEGER,
+                last_updated_utc INTEGER,
+                removed INTEGER DEFAULT 0,
+                raw TEXT
+            );
+            INSERT INTO posts (id, subreddit, title) VALUES ('abc', 'rust', 'old');
+            INSERT INTO comments (id, post_id, subreddit, body) VALUES ('def', 'abc', 'rust', 'old');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(post_count(&paths, "rust").unwrap(), 1);
+
+        let rows = query(
+            &paths,
+            "SELECT source FROM posts WHERE id = 'abc'
+             UNION ALL
+             SELECT source FROM comments WHERE id = 'def'
+             ORDER BY source",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("source"), Some(&json!("json")));
+        assert_eq!(rows[1].get("source"), Some(&json!("json")));
+        assert_eq!(
+            query(&paths, "SELECT version FROM schema_meta").unwrap()[0].get("version"),
+            Some(&json!(3))
         );
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
@@ -1219,6 +1380,140 @@ mod tests {
                 .get("parent_id"),
             Some(&json!("t3_abc"))
         );
+        assert_eq!(
+            query(&paths, "SELECT source FROM posts WHERE id = 'abc'").unwrap()[0].get("source"),
+            Some(&json!("json"))
+        );
+        assert_eq!(
+            query(&paths, "SELECT source FROM comments WHERE id = 'def'").unwrap()[0].get("source"),
+            Some(&json!("json"))
+        );
+        let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn rss_upsert_records_source_and_does_not_downgrade_json_metadata() {
+        let paths = temp_paths();
+        let mut rss_post = test_post("rsspost");
+        rss_post.source = ItemSource::Rss;
+        rss_post.title = Some("RSS title".to_owned());
+        rss_post.author = Some("rss_author".to_owned());
+        rss_post.body = Some("RSS body".to_owned());
+        rss_post.url = Some("https://www.reddit.com/r/rust/comments/rsspost/post/".to_owned());
+        rss_post.flair = None;
+        rss_post.is_self = None;
+        rss_post.over_18 = None;
+        rss_post.score = None;
+        rss_post.upvote_ratio = None;
+        rss_post.num_comments = None;
+        rss_post.created_utc = None;
+        rss_post.edited_utc = None;
+        let mut rss_comment = test_comment("rsscomment", "t3_rsspost");
+        rss_comment.source = ItemSource::Rss;
+        rss_comment.post_id = Some("rsspost".to_owned());
+        rss_comment.parent_id = None;
+        rss_comment.author = Some("rss_commenter".to_owned());
+        rss_comment.body = Some("RSS comment body".to_owned());
+        rss_comment.score = None;
+        rss_comment.created_utc = None;
+        rss_comment.edited_utc = None;
+
+        upsert_items(
+            &paths,
+            "rust",
+            StreamKind::Posts,
+            std::slice::from_ref(&rss_post),
+        )
+        .unwrap();
+        upsert_items(
+            &paths,
+            "rust",
+            StreamKind::Comments,
+            std::slice::from_ref(&rss_comment),
+        )
+        .unwrap();
+
+        assert_eq!(
+            query(
+                &paths,
+                "SELECT source, score, upvote_ratio, num_comments FROM posts WHERE id = 'rsspost'",
+            )
+            .unwrap()[0]
+                .get("source"),
+            Some(&json!("rss"))
+        );
+        assert_eq!(
+            query(
+                &paths,
+                "SELECT source, parent_id, score FROM comments WHERE id = 'rsscomment'"
+            )
+            .unwrap()[0]
+                .get("source"),
+            Some(&json!("rss"))
+        );
+
+        let mut json_post = rss_post.clone();
+        json_post.source = ItemSource::Json;
+        json_post.title = Some("JSON title".to_owned());
+        json_post.author = Some("json_author".to_owned());
+        json_post.body = Some("JSON body".to_owned());
+        json_post.url = Some("https://example.com/json".to_owned());
+        json_post.flair = Some("discussion".to_owned());
+        json_post.is_self = Some(true);
+        json_post.over_18 = Some(false);
+        json_post.score = Some(10);
+        json_post.upvote_ratio = Some(0.8);
+        json_post.num_comments = Some(4);
+        json_post.created_utc = Some(100.0);
+        json_post.edited_utc = Some(120.0);
+        let mut json_comment = rss_comment.clone();
+        json_comment.source = ItemSource::Json;
+        json_comment.parent_id = Some("t3_rsspost".to_owned());
+        json_comment.author = Some("json_commenter".to_owned());
+        json_comment.body = Some("JSON comment body".to_owned());
+        json_comment.score = Some(6);
+        json_comment.created_utc = Some(101.0);
+        json_comment.edited_utc = Some(121.0);
+
+        upsert_items(&paths, "rust", StreamKind::Posts, &[json_post]).unwrap();
+        upsert_items(&paths, "rust", StreamKind::Comments, &[json_comment]).unwrap();
+        upsert_items(&paths, "rust", StreamKind::Posts, &[rss_post]).unwrap();
+        upsert_items(&paths, "rust", StreamKind::Comments, &[rss_comment]).unwrap();
+
+        let rows = query(
+            &paths,
+            "SELECT title, author, selftext, url, flair, is_self, over_18, score,
+                    upvote_ratio, num_comments, created_utc, edited_utc, source
+             FROM posts WHERE id = 'rsspost'",
+        )
+        .unwrap();
+        assert_eq!(rows[0].get("title"), Some(&json!("JSON title")));
+        assert_eq!(rows[0].get("author"), Some(&json!("json_author")));
+        assert_eq!(rows[0].get("selftext"), Some(&json!("JSON body")));
+        assert_eq!(rows[0].get("url"), Some(&json!("https://example.com/json")));
+        assert_eq!(rows[0].get("flair"), Some(&json!("discussion")));
+        assert_eq!(rows[0].get("is_self"), Some(&json!(1)));
+        assert_eq!(rows[0].get("over_18"), Some(&json!(0)));
+        assert_eq!(rows[0].get("source"), Some(&json!("json")));
+        assert_eq!(rows[0].get("score"), Some(&json!(10)));
+        assert_eq!(rows[0].get("upvote_ratio"), Some(&json!(0.8)));
+        assert_eq!(rows[0].get("num_comments"), Some(&json!(4)));
+        assert_eq!(rows[0].get("created_utc"), Some(&json!(100)));
+        assert_eq!(rows[0].get("edited_utc"), Some(&json!(120)));
+
+        let rows = query(
+            &paths,
+            "SELECT author, body, source, parent_id, score, created_utc, edited_utc
+             FROM comments WHERE id = 'rsscomment'",
+        )
+        .unwrap();
+        assert_eq!(rows[0].get("author"), Some(&json!("json_commenter")));
+        assert_eq!(rows[0].get("body"), Some(&json!("JSON comment body")));
+        assert_eq!(rows[0].get("source"), Some(&json!("json")));
+        assert_eq!(rows[0].get("parent_id"), Some(&json!("t3_rsspost")));
+        assert_eq!(rows[0].get("score"), Some(&json!(6)));
+        assert_eq!(rows[0].get("created_utc"), Some(&json!(101)));
+        assert_eq!(rows[0].get("edited_utc"), Some(&json!(121)));
         let _ = fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 

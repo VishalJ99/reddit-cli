@@ -18,6 +18,7 @@ The product boundary is important: the tool may search, browse, read, copy/open 
 - Digest issue: `PER-289` (`Implement LLM-ready local digest`)
 - Backfill issue: `PER-291` (`Implement recent post sync backfill`)
 - RSS sync issue: `PER-293` (`Implement RSS degraded sync into SQLite`)
+- Source provenance issue: `PER-294` (`Persist Reddit item source provenance`)
 - GitHub target: `VishalJ99/reddit-cli`
 
 Commit bodies should put the ticket ID on the first body line.
