@@ -5,6 +5,7 @@ use crate::model::{
 use anyhow::Result;
 use quick_xml::{Reader, events::Event};
 use serde_json::Value;
+use url::Url;
 
 pub fn parse_listing(value: &Value) -> Vec<RedditItem> {
     parse_listing_page(value).items
@@ -338,7 +339,7 @@ struct AtomEntry {
 
 impl AtomEntry {
     fn to_item(&self, index: usize) -> RedditItem {
-        let id = self
+        let raw_id = self
             .id
             .as_deref()
             .or(self.link.as_deref())
@@ -346,16 +347,27 @@ impl AtomEntry {
             .to_owned();
 
         let link = self.link.as_deref().map(canonical_permalink);
+        let permalink_ids = link.as_deref().and_then(extract_permalink_ids);
+        let fullname = atom_fullname(&raw_id, permalink_ids.as_ref());
+        let (kind, id) = atom_kind_and_id(&fullname);
+        let post_id = match kind {
+            ItemKind::Post => permalink_ids
+                .as_ref()
+                .map(|ids| ids.post_id.clone())
+                .or_else(|| Some(id.clone())),
+            ItemKind::Comment => permalink_ids.as_ref().map(|ids| ids.post_id.clone()),
+            _ => None,
+        };
         let subreddit = link.as_deref().and_then(extract_subreddit);
         RedditItem {
             index: Some(index + 1),
-            kind: ItemKind::Post,
-            id: id.clone(),
-            fullname: id,
+            kind,
+            id,
+            fullname,
             parent_id: None,
-            post_id: None,
+            post_id,
             title: self.title.clone(),
-            author: self.author.clone(),
+            author: clean_atom_author(self.author.as_deref()),
             subreddit,
             body: self.body.clone(),
             flair: None,
@@ -372,6 +384,60 @@ impl AtomEntry {
             source: ItemSource::Rss,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct PermalinkIds {
+    post_id: String,
+    comment_id: Option<String>,
+}
+
+fn atom_fullname(raw_id: &str, permalink_ids: Option<&PermalinkIds>) -> String {
+    if raw_id.starts_with("t3_") || raw_id.starts_with("t1_") {
+        return raw_id.to_owned();
+    }
+    if let Some(ids) = permalink_ids {
+        if let Some(comment_id) = &ids.comment_id {
+            return format!("t1_{comment_id}");
+        }
+        return format!("t3_{}", ids.post_id);
+    }
+    raw_id.to_owned()
+}
+
+fn atom_kind_and_id(fullname: &str) -> (ItemKind, String) {
+    if let Some(id) = fullname.strip_prefix("t3_") {
+        (ItemKind::Post, id.to_owned())
+    } else if let Some(id) = fullname.strip_prefix("t1_") {
+        (ItemKind::Comment, id.to_owned())
+    } else {
+        (ItemKind::Post, fullname.to_owned())
+    }
+}
+
+fn extract_permalink_ids(url: &str) -> Option<PermalinkIds> {
+    let path = Url::parse(url)
+        .map(|url| url.path().to_owned())
+        .unwrap_or_else(|_| url.to_owned());
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let comments = parts.iter().position(|part| *part == "comments")?;
+    let post_id = parts.get(comments + 1)?.to_string();
+    let comment_id = parts.get(comments + 3).map(|value| (*value).to_owned());
+    Some(PermalinkIds {
+        post_id,
+        comment_id,
+    })
+}
+
+fn clean_atom_author(author: Option<&str>) -> Option<String> {
+    author
+        .map(str::trim)
+        .map(|author| author.trim_start_matches("/u/"))
+        .filter(|author| !author.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn extract_subreddit(url: &str) -> Option<String> {
@@ -471,5 +537,55 @@ mod tests {
         assert_eq!(capture.comments[0].parent_id.as_deref(), Some("t1_c1"));
         assert_eq!(capture.more_stubs.len(), 1);
         assert_eq!(capture.more_stubs[0].parent_id.as_deref(), Some("t1_c3"));
+    }
+
+    #[test]
+    fn parses_atom_post_with_reddit_ids() {
+        let xml = r#"
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <id>t3_abc123</id>
+                <title>Hello RSS</title>
+                <author><name>/u/alice</name></author>
+                <link href="https://www.reddit.com/r/rust/comments/abc123/hello_rss/" />
+                <updated>2026-06-11T12:00:00Z</updated>
+                <content>body</content>
+              </entry>
+            </feed>
+        "#;
+
+        let items = parse_atom_entries(xml).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Post);
+        assert_eq!(items[0].id, "abc123");
+        assert_eq!(items[0].fullname, "t3_abc123");
+        assert_eq!(items[0].post_id.as_deref(), Some("abc123"));
+        assert_eq!(items[0].author.as_deref(), Some("alice"));
+        assert_eq!(items[0].subreddit.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn parses_atom_comment_with_post_association() {
+        let xml = r#"
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <id>t1_def456</id>
+                <title>comment</title>
+                <author><name>/u/bob</name></author>
+                <link href="https://www.reddit.com/r/rust/comments/abc123/hello_rss/def456/" />
+                <updated>2026-06-11T12:00:00Z</updated>
+                <content>reply</content>
+              </entry>
+            </feed>
+        "#;
+
+        let items = parse_atom_entries(xml).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Comment);
+        assert_eq!(items[0].id, "def456");
+        assert_eq!(items[0].fullname, "t1_def456");
+        assert_eq!(items[0].post_id.as_deref(), Some("abc123"));
+        assert_eq!(items[0].parent_id, None);
+        assert_eq!(items[0].author.as_deref(), Some("bob"));
     }
 }

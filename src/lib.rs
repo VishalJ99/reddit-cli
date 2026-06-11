@@ -107,12 +107,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Commands::Sync(command) => {
-            if cli.rss {
+            if cli.rss && command.refresh {
                 anyhow::bail!(
-                    "rdt --rss sync is planned but not implemented yet; run JSON sync or use RSS browse/search for degraded reads"
+                    "rdt --rss sync --refresh is not supported; RSS degraded sync skips JSON refresh"
                 );
             }
-
             let client = RedditClient::new(&config, &paths, &cli)?;
             loop {
                 let reports = sync::run_once(&paths, &client, &config, command).await?;

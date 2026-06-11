@@ -1,7 +1,7 @@
 use crate::{
     cli::{SyncCommand, ThreadCommand, ThreadSort},
     config::{Config, Paths},
-    model::{ItemKind, ListingPage, RedditItem},
+    model::{ItemKind, ItemSource, ListingPage, RedditItem},
     store::{self, StreamKind, SyncStreamReport, WatchTarget},
     transport::RedditClient,
 };
@@ -42,7 +42,10 @@ pub async fn run_once(
 
     let mut reports = Vec::new();
     for target in targets {
-        let options = effective_options(command, config, &target);
+        let mut options = effective_options(command, config, &target);
+        if client.is_force_rss() {
+            options.refresh = false;
+        }
         reports
             .push(sync_stream(paths, client, &target.subreddit, StreamKind::Posts, options).await?);
         reports.push(
@@ -93,6 +96,9 @@ async fn sync_backfill(
                 store::append_sync_log(paths, &report, started, store::utc_now(), Some(&message))
             {
                 return Err(error.context(format!("also failed to append sync_log: {log_error}")));
+            }
+            if client.is_force_rss() {
+                return Ok(report);
             }
             Err(error)
         }
@@ -253,6 +259,9 @@ async fn sync_refresh(
             {
                 return Err(error.context(format!("also failed to append sync_log: {log_error}")));
             }
+            if client.is_force_rss() {
+                return Ok(report);
+            }
             Err(error)
         }
     }
@@ -291,6 +300,9 @@ async fn sync_stream(
             {
                 return Err(error.context(format!("also failed to append sync_log: {log_error}")));
             }
+            if client.is_force_rss() {
+                return Ok(report);
+            }
             Err(error)
         }
     }
@@ -316,6 +328,7 @@ async fn sync_stream_inner(
     let mut after = None;
     let mut newest_fullname = None;
     let mut status = "ok".to_owned();
+    let mut notice = None;
 
     while progress.http_requests < page_cap && remaining > 0 {
         let page_limit = remaining.min(100) as u32;
@@ -323,6 +336,12 @@ async fn sync_stream_inner(
         let page = client
             .sync_listing_page(subreddit, listing, page_limit, after.as_deref())
             .await?;
+        let rss_degraded = page.items.iter().any(|item| item.source == ItemSource::Rss);
+        if rss_degraded {
+            notice = Some(
+                "RSS degraded mode: scores and comment parent metadata are unavailable".to_owned(),
+            );
+        }
 
         if progress.http_requests == 1 {
             newest_fullname = page.items.first().map(|item| item.fullname.clone());
@@ -343,6 +362,13 @@ async fn sync_stream_inner(
         let fully_known = known == relevant_len;
         let next_after = page.after;
         if fully_known || next_after.is_none() {
+            if rss_degraded && !fully_known && relevant_len >= page_limit as usize {
+                status = "gap".to_owned();
+                notice = Some(
+                    "RSS degraded mode: feed page was full and no pagination cursor is available"
+                        .to_owned(),
+                );
+            }
             after = None;
             break;
         }
@@ -362,7 +388,7 @@ async fn sync_stream_inner(
         http_requests: progress.http_requests,
         status,
         remaining_items: None,
-        notice: None,
+        notice,
     };
     Ok(report)
 }

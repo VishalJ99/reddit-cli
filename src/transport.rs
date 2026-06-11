@@ -25,6 +25,7 @@ const USER_AGENT: &str = concat!(
     " by u/local-readonly"
 );
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_RETRY_AFTER: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheMode {
@@ -64,6 +65,10 @@ impl RedditClient {
                 .map(Duration::from_secs)
                 .unwrap_or(DEFAULT_CACHE_TTL),
         })
+    }
+
+    pub fn is_force_rss(&self) -> bool {
+        self.force_rss
     }
 
     pub async fn search(&self, command: &SearchCommand) -> Result<Vec<RedditItem>> {
@@ -127,8 +132,16 @@ impl RedditClient {
     ) -> Result<ListingPage> {
         let subreddit = subreddit_segment(subreddit)?;
         let listing = listing_segment(listing)?;
-        let path = format!("/r/{subreddit}/{listing}.json");
         let limit = limit.clamp(1, 100).to_string();
+        if self.force_rss {
+            let path = format!("/r/{subreddit}/{listing}.rss");
+            let params = [("limit", limit.as_str())];
+            return self
+                .fetch_rss_listing_page(&path, &params, CacheMode::Bypass)
+                .await;
+        }
+
+        let path = format!("/r/{subreddit}/{listing}.json");
         let mut owned = vec![("limit".to_owned(), limit)];
         if let Some(after) = after {
             owned.push(("after".to_owned(), after.to_owned()));
@@ -387,13 +400,29 @@ impl RedditClient {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<Vec<RedditItem>> {
+        Ok(self
+            .fetch_rss_listing_page(path, params, CacheMode::Use)
+            .await?
+            .items)
+    }
+
+    async fn fetch_rss_listing_page(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        cache_mode: CacheMode,
+    ) -> Result<ListingPage> {
         eprintln!("warning: RSS degraded mode; scores and some metadata are unavailable");
-        let text = self.get_text(path, params, true, CacheMode::Use).await?;
+        let text = self.get_text(path, params, true, cache_mode).await?;
         let mut items = parse::parse_atom_entries(&text)?;
         for (index, item) in items.iter_mut().enumerate() {
             item.index = Some(index + 1);
         }
-        Ok(items)
+        Ok(ListingPage {
+            items,
+            after: None,
+            before: None,
+        })
     }
 
     async fn fetch_thread_rss(&self, path: &str) -> Result<ThreadView> {
@@ -524,7 +553,10 @@ impl RedditClient {
         if status.as_u16() == 429 {
             return Err(RdtError::HttpStatus {
                 status: status.as_u16(),
-                url: format!("{url} retry_after={}", retry_after.unwrap_or(1)),
+                url: format!(
+                    "{url} retry_after={}",
+                    retry_after.unwrap_or(DEFAULT_RETRY_AFTER)
+                ),
                 body: text.chars().take(240).collect(),
             }
             .into());
@@ -571,7 +603,7 @@ impl RedditClient {
                     .and_then(|value| value.parse::<u64>().ok()),
                 _ => None,
             })
-            .unwrap_or(1)
+            .unwrap_or(DEFAULT_RETRY_AFTER)
             .min(60);
         tokio::time::sleep(Duration::from_secs(seconds)).await;
     }
